@@ -1,0 +1,48 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file: .env
+    volumes:
+      - ./backend:/app
+      - app_data:/data
+    depends_on:
+      - redis
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: celery -A celery_app.celery worker --loglevel=info --concurrency=2
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./backend:/app
+      - app_data:/data
+    depends_on:
+      - redis
+    # Scale horizontally: docker compose up --scale worker=4
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 4G  # Whisper model needs ~2 GB
+
+volumes:
+  redis_data:
+  app_data:

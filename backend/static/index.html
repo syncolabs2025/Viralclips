@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ViralClips</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f0f12;
+      --surface: #1a1a20;
+      --border: #2a2a35;
+      --accent: #7c3aed;
+      --accent-light: #a78bfa;
+      --text: #e2e2e8;
+      --muted: #888894;
+      --success: #22c55e;
+      --error: #ef4444;
+      --warn: #f59e0b;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem 4rem;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 2.5rem;
+    }
+
+    header h1 {
+      font-size: 2.2rem;
+      font-weight: 800;
+      background: linear-gradient(135deg, var(--accent-light), #c084fc);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    header p {
+      color: var(--muted);
+      margin-top: 0.4rem;
+      font-size: 1rem;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 2rem;
+      width: 100%;
+      max-width: 680px;
+    }
+
+    /* Upload zone */
+    #drop-zone {
+      border: 2px dashed var(--border);
+      border-radius: 12px;
+      padding: 3rem 2rem;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+    }
+
+    #drop-zone.drag-over,
+    #drop-zone:hover {
+      border-color: var(--accent-light);
+      background: rgba(124,58,237,0.06);
+    }
+
+    #drop-zone svg { color: var(--accent-light); margin-bottom: 0.75rem; }
+
+    #drop-zone p { color: var(--muted); font-size: 0.95rem; }
+    #drop-zone strong { color: var(--text); }
+
+    #file-input { display: none; }
+
+    #selected-file {
+      margin-top: 1rem;
+      font-size: 0.9rem;
+      color: var(--accent-light);
+      text-align: center;
+      min-height: 1.2em;
+    }
+
+    button {
+      display: block;
+      width: 100%;
+      margin-top: 1.25rem;
+      padding: 0.85rem;
+      background: var(--accent);
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 600;
+      border: none;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: background 0.2s, opacity 0.2s;
+    }
+
+    button:hover:not(:disabled) { background: #6d28d9; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    /* Progress / status */
+    #status-section { display: none; margin-top: 2rem; }
+
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      font-size: 0.95rem;
+    }
+
+    .spinner {
+      width: 20px; height: 20px;
+      border: 3px solid var(--border);
+      border-top-color: var(--accent-light);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      flex-shrink: 0;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .badge {
+      display: inline-block;
+      padding: 0.2em 0.65em;
+      border-radius: 6px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .badge-pending   { background: rgba(245,158,11,.15); color: var(--warn); }
+    .badge-running   { background: rgba(124,58,237,.18); color: var(--accent-light); }
+    .badge-complete  { background: rgba(34,197,94,.15);  color: var(--success); }
+    .badge-failed    { background: rgba(239,68,68,.15);  color: var(--error); }
+
+    .progress-bar-wrap {
+      background: var(--border);
+      border-radius: 999px;
+      height: 6px;
+      margin-top: 0.75rem;
+      overflow: hidden;
+    }
+
+    .progress-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), var(--accent-light));
+      border-radius: 999px;
+      transition: width 0.4s ease;
+    }
+
+    .progress-label {
+      font-size: 0.82rem;
+      color: var(--muted);
+      margin-top: 0.3rem;
+      text-align: right;
+    }
+
+    /* Clips list */
+    #clips-section { display: none; margin-top: 2rem; }
+
+    #clips-section h2 {
+      font-size: 1rem;
+      font-weight: 700;
+      margin-bottom: 1rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .clip-row {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0.85rem 1rem;
+      margin-bottom: 0.6rem;
+      display: flex;
+      align-items: flex-start;
+      gap: 0.75rem;
+    }
+
+    .clip-time {
+      font-size: 0.8rem;
+      font-weight: 700;
+      color: var(--accent-light);
+      white-space: nowrap;
+      margin-top: 0.1rem;
+    }
+
+    .clip-reason { font-size: 0.9rem; line-height: 1.4; }
+
+    /* Download button */
+    #download-btn {
+      display: none;
+      margin-top: 1.5rem;
+      background: #16a34a;
+    }
+
+    #download-btn:hover:not(:disabled) { background: #15803d; }
+
+    #error-box {
+      display: none;
+      margin-top: 1rem;
+      padding: 0.85rem 1rem;
+      background: rgba(239,68,68,.1);
+      border: 1px solid rgba(239,68,68,.3);
+      border-radius: 10px;
+      color: var(--error);
+      font-size: 0.9rem;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>ViralClips</h1>
+    <p>Upload a video — get AI-clipped, 9:16 reframed highlights ready for Reels &amp; Shorts</p>
+  </header>
+
+  <div class="card">
+    <!-- Upload -->
+    <div id="drop-zone">
+      <svg width="40" height="40" viewBox="0 0 24 24" fill="none"
+           stroke="currentColor" stroke-width="1.5" stroke-linecap="round"
+           stroke-linejoin="round">
+        <polyline points="16 16 12 12 8 16"></polyline>
+        <line x1="12" y1="12" x2="12" y2="21"></line>
+        <path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"></path>
+      </svg>
+      <p><strong>Drop a video here</strong> or click to browse</p>
+      <p style="margin-top:0.3rem;font-size:0.82rem;">MP4, MOV, AVI, MKV, WebM</p>
+    </div>
+    <input type="file" id="file-input" accept="video/*" />
+    <div id="selected-file"></div>
+    <button id="upload-btn" disabled>Process Video</button>
+
+    <!-- Error -->
+    <div id="error-box"></div>
+
+    <!-- Status -->
+    <div id="status-section">
+      <div class="status-row">
+        <div class="spinner" id="status-spinner"></div>
+        <span id="status-label">Processing…</span>
+      </div>
+      <div class="progress-bar-wrap" style="margin-top:1rem;">
+        <div class="progress-bar-fill" id="progress-fill" style="width:0%"></div>
+      </div>
+      <div class="progress-label" id="progress-label"></div>
+    </div>
+
+    <!-- Clips -->
+    <div id="clips-section">
+      <h2>Detected Clips</h2>
+      <div id="clips-list"></div>
+    </div>
+
+    <!-- Download -->
+    <button id="download-btn">Download 9:16 Clips (.zip)</button>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

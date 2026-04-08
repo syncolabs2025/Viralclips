@@ -1,0 +1,28 @@
+# Web framework
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-multipart==0.0.20
+aiofiles==24.1.0
+
+# Task queue
+celery[redis]==5.4.0
+redis==5.2.1
+
+# Database
+sqlalchemy==2.0.36
+
+# AI / ML
+openai==1.58.1
+openai-whisper==20240930
+
+# HTTP
+requests==2.32.3
+
+# torch is required by whisper — install CPU-only to keep image size manageable.
+# Switch to the GPU wheel in your Dockerfile if you have a CUDA host.
+torch==2.5.1+cpu ; sys_platform != "darwin"
+torch==2.5.1     ; sys_platform == "darwin"
+torchvision==0.20.1+cpu ; sys_platform != "darwin"
+torchvision==0.20.1     ; sys_platform == "darwin"
+torchaudio==2.5.1+cpu ; sys_platform != "darwin"
+torchaudio==2.5.1     ; sys_platform == "darwin"
