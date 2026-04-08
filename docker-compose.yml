@@ -1,6 +1,20 @@
 version: "3.9"
 
 services:
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: viralclips
+      POSTGRES_PASSWORD: viralclips
+      POSTGRES_DB: viralclips
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+
   redis:
     image: redis:7-alpine
     restart: unless-stopped
@@ -18,31 +32,39 @@ services:
     ports:
       - "8000:8000"
     env_file: .env
+    environment:
+      DATABASE_URL: postgresql://viralclips:viralclips@postgres:5432/viralclips
+      REDIS_URL: redis://redis:6379/0
     volumes:
       - ./backend:/app
-      - app_data:/data
+      - local_storage:/tmp/viralclips
     depends_on:
+      - postgres
       - redis
 
   worker:
     build:
-      context: ./backend
+      context: ./worker
       dockerfile: Dockerfile
-    command: celery -A celery_app.celery worker --loglevel=info --concurrency=2
+    command: python worker.py
     restart: unless-stopped
     env_file: .env
+    environment:
+      DATABASE_URL: postgresql://viralclips:viralclips@postgres:5432/viralclips
+      REDIS_URL: redis://redis:6379/0
     volumes:
-      - ./backend:/app
-      - app_data:/data
+      - ./worker:/app
+      - local_storage:/tmp/viralclips
     depends_on:
+      - postgres
       - redis
-    # Scale horizontally: docker compose up --scale worker=4
     deploy:
-      replicas: 1
       resources:
         limits:
-          memory: 4G  # Whisper model needs ~2 GB
+          memory: 8G
+    # To add more workers: docker compose up --scale worker=4
 
 volumes:
+  postgres_data:
   redis_data:
-  app_data:
+  local_storage:

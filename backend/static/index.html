@@ -1,273 +1,469 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>ViralClips</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-    :root {
-      --bg: #0f0f12;
-      --surface: #1a1a20;
-      --border: #2a2a35;
-      --accent: #7c3aed;
-      --accent-light: #a78bfa;
-      --text: #e2e2e8;
-      --muted: #888894;
-      --success: #22c55e;
-      --error: #ef4444;
-      --warn: #f59e0b;
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    :root{
+      --bg:#0a0a0f;--surface:#13131a;--card:#1c1c26;--border:#2a2a38;
+      --accent:#7c3aed;--accent2:#a78bfa;--text:#e8e8f0;--muted:#666680;
+      --green:#22c55e;--red:#ef4444;--yellow:#f59e0b;--blue:#3b82f6;
     }
-
-    body {
-      background: var(--bg);
-      color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      min-height: 100vh;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      padding: 2rem 1rem 4rem;
-    }
-
-    header {
-      text-align: center;
-      margin-bottom: 2.5rem;
-    }
-
-    header h1 {
-      font-size: 2.2rem;
-      font-weight: 800;
-      background: linear-gradient(135deg, var(--accent-light), #c084fc);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-    }
-
-    header p {
-      color: var(--muted);
-      margin-top: 0.4rem;
-      font-size: 1rem;
-    }
-
-    .card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      padding: 2rem;
-      width: 100%;
-      max-width: 680px;
-    }
-
-    /* Upload zone */
-    #drop-zone {
-      border: 2px dashed var(--border);
-      border-radius: 12px;
-      padding: 3rem 2rem;
-      text-align: center;
-      cursor: pointer;
-      transition: border-color 0.2s, background 0.2s;
-    }
-
-    #drop-zone.drag-over,
-    #drop-zone:hover {
-      border-color: var(--accent-light);
-      background: rgba(124,58,237,0.06);
-    }
-
-    #drop-zone svg { color: var(--accent-light); margin-bottom: 0.75rem; }
-
-    #drop-zone p { color: var(--muted); font-size: 0.95rem; }
-    #drop-zone strong { color: var(--text); }
-
-    #file-input { display: none; }
-
-    #selected-file {
-      margin-top: 1rem;
-      font-size: 0.9rem;
-      color: var(--accent-light);
-      text-align: center;
-      min-height: 1.2em;
-    }
-
-    button {
-      display: block;
-      width: 100%;
-      margin-top: 1.25rem;
-      padding: 0.85rem;
-      background: var(--accent);
-      color: #fff;
-      font-size: 1rem;
-      font-weight: 600;
-      border: none;
-      border-radius: 10px;
-      cursor: pointer;
-      transition: background 0.2s, opacity 0.2s;
-    }
-
-    button:hover:not(:disabled) { background: #6d28d9; }
-    button:disabled { opacity: 0.45; cursor: not-allowed; }
-
-    /* Progress / status */
-    #status-section { display: none; margin-top: 2rem; }
-
-    .status-row {
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-      font-size: 0.95rem;
-    }
-
-    .spinner {
-      width: 20px; height: 20px;
-      border: 3px solid var(--border);
-      border-top-color: var(--accent-light);
-      border-radius: 50%;
-      animation: spin 0.8s linear infinite;
-      flex-shrink: 0;
-    }
-
-    @keyframes spin { to { transform: rotate(360deg); } }
-
-    .badge {
-      display: inline-block;
-      padding: 0.2em 0.65em;
-      border-radius: 6px;
-      font-size: 0.78rem;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-    }
-
-    .badge-pending   { background: rgba(245,158,11,.15); color: var(--warn); }
-    .badge-running   { background: rgba(124,58,237,.18); color: var(--accent-light); }
-    .badge-complete  { background: rgba(34,197,94,.15);  color: var(--success); }
-    .badge-failed    { background: rgba(239,68,68,.15);  color: var(--error); }
-
-    .progress-bar-wrap {
-      background: var(--border);
-      border-radius: 999px;
-      height: 6px;
-      margin-top: 0.75rem;
-      overflow: hidden;
-    }
-
-    .progress-bar-fill {
-      height: 100%;
-      background: linear-gradient(90deg, var(--accent), var(--accent-light));
-      border-radius: 999px;
-      transition: width 0.4s ease;
-    }
-
-    .progress-label {
-      font-size: 0.82rem;
-      color: var(--muted);
-      margin-top: 0.3rem;
-      text-align: right;
-    }
-
-    /* Clips list */
-    #clips-section { display: none; margin-top: 2rem; }
-
-    #clips-section h2 {
-      font-size: 1rem;
-      font-weight: 700;
-      margin-bottom: 1rem;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-    }
-
-    .clip-row {
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 0.85rem 1rem;
-      margin-bottom: 0.6rem;
-      display: flex;
-      align-items: flex-start;
-      gap: 0.75rem;
-    }
-
-    .clip-time {
-      font-size: 0.8rem;
-      font-weight: 700;
-      color: var(--accent-light);
-      white-space: nowrap;
-      margin-top: 0.1rem;
-    }
-
-    .clip-reason { font-size: 0.9rem; line-height: 1.4; }
-
-    /* Download button */
-    #download-btn {
-      display: none;
-      margin-top: 1.5rem;
-      background: #16a34a;
-    }
-
-    #download-btn:hover:not(:disabled) { background: #15803d; }
-
-    #error-box {
-      display: none;
-      margin-top: 1rem;
-      padding: 0.85rem 1rem;
-      background: rgba(239,68,68,.1);
-      border: 1px solid rgba(239,68,68,.3);
-      border-radius: 10px;
-      color: var(--error);
-      font-size: 0.9rem;
-    }
+    html,body,#root{height:100%}
+    body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:15px}
+    ::-webkit-scrollbar{width:6px}
+    ::-webkit-scrollbar-track{background:var(--bg)}
+    ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
   </style>
 </head>
 <body>
-  <header>
-    <h1>ViralClips</h1>
-    <p>Upload a video — get AI-clipped, 9:16 reframed highlights ready for Reels &amp; Shorts</p>
-  </header>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
 
-  <div class="card">
-    <!-- Upload -->
-    <div id="drop-zone">
-      <svg width="40" height="40" viewBox="0 0 24 24" fill="none"
-           stroke="currentColor" stroke-width="1.5" stroke-linecap="round"
-           stroke-linejoin="round">
-        <polyline points="16 16 12 12 8 16"></polyline>
-        <line x1="12" y1="12" x2="12" y2="21"></line>
-        <path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"></path>
-      </svg>
-      <p><strong>Drop a video here</strong> or click to browse</p>
-      <p style="margin-top:0.3rem;font-size:0.82rem;">MP4, MOV, AVI, MKV, WebM</p>
+// ── API helpers ──────────────────────────────────────────────────────────────
+const api = {
+  token: () => localStorage.getItem("vc_token"),
+  headers: () => ({ "Content-Type": "application/json", Authorization: `Bearer ${api.token()}` }),
+
+  async call(method, path, body) {
+    const res = await fetch(path, {
+      method,
+      headers: api.headers(),
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || "Request failed");
+    }
+    return res.json();
+  },
+
+  get:  (path)       => api.call("GET", path),
+  post: (path, body) => api.call("POST", path, body),
+};
+
+// ── Tiny CSS-in-JS ───────────────────────────────────────────────────────────
+const S = {
+  page:     { minHeight:"100vh", display:"flex", flexDirection:"column", alignItems:"center", padding:"2rem 1rem 5rem" },
+  header:   { textAlign:"center", marginBottom:"2.5rem" },
+  h1:       { fontSize:"2rem", fontWeight:800, background:"linear-gradient(135deg,#a78bfa,#c084fc)", WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent" },
+  sub:      { color:"var(--muted)", marginTop:".35rem", fontSize:".9rem" },
+  card:     { background:"var(--card)", border:"1px solid var(--border)", borderRadius:16, padding:"1.75rem", width:"100%", maxWidth:660 },
+  label:    { display:"block", marginBottom:".4rem", fontSize:".82rem", color:"var(--muted)", fontWeight:600, textTransform:"uppercase", letterSpacing:".05em" },
+  input:    { width:"100%", padding:".65rem .85rem", background:"var(--surface)", border:"1px solid var(--border)", borderRadius:8, color:"var(--text)", fontSize:"1rem", outline:"none" },
+  btn:      { display:"block", width:"100%", padding:".8rem", background:"var(--accent)", color:"#fff", fontWeight:700, border:"none", borderRadius:10, cursor:"pointer", fontSize:"1rem", transition:"background .2s" },
+  btnGreen: { display:"block", width:"100%", padding:".8rem", background:"#16a34a", color:"#fff", fontWeight:700, border:"none", borderRadius:10, cursor:"pointer", fontSize:"1rem" },
+  btnSm:    { padding:".45rem .9rem", background:"var(--accent)", color:"#fff", fontWeight:600, border:"none", borderRadius:8, cursor:"pointer", fontSize:".85rem" },
+  link:     { color:"var(--accent2)", cursor:"pointer", background:"none", border:"none", fontSize:"inherit" },
+  error:    { marginTop:".75rem", padding:".7rem .9rem", background:"rgba(239,68,68,.12)", border:"1px solid rgba(239,68,68,.3)", borderRadius:8, color:"var(--red)", fontSize:".88rem" },
+  row:      { display:"flex", gap:".75rem", alignItems:"center" },
+  spacer:   { marginTop:"1.25rem" },
+};
+
+// ── Badge ────────────────────────────────────────────────────────────────────
+const BADGE_COLORS = {
+  pending:      ["rgba(245,158,11,.14)","var(--yellow)"],
+  uploading:    ["rgba(59,130,246,.14)","var(--blue)"],
+  downloading:  ["rgba(59,130,246,.14)","var(--blue)"],
+  transcribing: ["rgba(124,58,237,.18)","var(--accent2)"],
+  detecting:    ["rgba(124,58,237,.18)","var(--accent2)"],
+  reframing:    ["rgba(124,58,237,.18)","var(--accent2)"],
+  zipping:      ["rgba(124,58,237,.18)","var(--accent2)"],
+  complete:     ["rgba(34,197,94,.14)","var(--green)"],
+  failed:       ["rgba(239,68,68,.14)","var(--red)"],
+};
+function Badge({ status }) {
+  const [bg, color] = BADGE_COLORS[status] || BADGE_COLORS.pending;
+  return (
+    <span style={{ display:"inline-block", padding:".2em .65em", borderRadius:6, fontSize:".75rem", fontWeight:700, textTransform:"uppercase", letterSpacing:".05em", background:bg, color }}>
+      {status}
+    </span>
+  );
+}
+
+// ── ProgressBar ───────────────────────────────────────────────────────────────
+function ProgressBar({ pct }) {
+  return (
+    <div style={{ background:"var(--border)", borderRadius:999, height:5, overflow:"hidden", marginTop:8 }}>
+      <div style={{ height:"100%", width:`${pct}%`, background:"linear-gradient(90deg,var(--accent),var(--accent2))", borderRadius:999, transition:"width .4s ease" }}/>
     </div>
-    <input type="file" id="file-input" accept="video/*" />
-    <div id="selected-file"></div>
-    <button id="upload-btn" disabled>Process Video</button>
+  );
+}
 
-    <!-- Error -->
-    <div id="error-box"></div>
+// ── Auth Page ─────────────────────────────────────────────────────────────────
+function AuthPage({ onLogin }) {
+  const [mode, setMode]   = useState("login");
+  const [email, setEmail] = useState("");
+  const [pass,  setPass]  = useState("");
+  const [err,   setErr]   = useState("");
+  const [busy,  setBusy]  = useState(false);
 
-    <!-- Status -->
-    <div id="status-section">
-      <div class="status-row">
-        <div class="spinner" id="status-spinner"></div>
-        <span id="status-label">Processing…</span>
+  async function submit(e) {
+    e.preventDefault();
+    setErr(""); setBusy(true);
+    try {
+      const path = mode === "login" ? "/auth/login" : "/auth/register";
+      const { access_token } = await api.post(path, { email, password: pass });
+      localStorage.setItem("vc_token", access_token);
+      onLogin();
+    } catch (ex) { setErr(ex.message); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <div style={S.page}>
+      <header style={S.header}>
+        <h1 style={S.h1}>ViralClips</h1>
+        <p style={S.sub}>AI-powered viral clip extraction & reframing</p>
+      </header>
+      <div style={S.card}>
+        <h2 style={{ fontWeight:700, marginBottom:"1.25rem" }}>{mode === "login" ? "Sign in" : "Create account"}</h2>
+        <form onSubmit={submit}>
+          <label style={S.label}>Email</label>
+          <input style={S.input} type="email" value={email} onChange={e=>setEmail(e.target.value)} required autoFocus/>
+          <div style={S.spacer}/>
+          <label style={S.label}>Password</label>
+          <input style={S.input} type="password" value={pass} onChange={e=>setPass(e.target.value)} required minLength={8}/>
+          {err && <div style={S.error}>{err}</div>}
+          <div style={{ ...S.spacer, marginTop:"1.5rem" }}>
+            <button style={S.btn} disabled={busy}>{busy ? "…" : mode === "login" ? "Sign in" : "Create account"}</button>
+          </div>
+        </form>
+        <p style={{ marginTop:"1rem", textAlign:"center", color:"var(--muted)", fontSize:".88rem" }}>
+          {mode === "login" ? "No account? " : "Already have one? "}
+          <button style={S.link} onClick={()=>{ setMode(mode==="login"?"register":"login"); setErr(""); }}>
+            {mode === "login" ? "Sign up free" : "Sign in"}
+          </button>
+        </p>
       </div>
-      <div class="progress-bar-wrap" style="margin-top:1rem;">
-        <div class="progress-bar-fill" id="progress-fill" style="width:0%"></div>
+    </div>
+  );
+}
+
+// ── Upload Zone ───────────────────────────────────────────────────────────────
+function UploadZone({ onJobCreated }) {
+  const [drag,     setDrag]     = useState(false);
+  const [file,     setFile]     = useState(null);
+  const [progress, setProgress] = useState(0);   // 0-100
+  const [phase,    setPhase]    = useState("");   // "uploading" | "confirming"
+  const [err,      setErr]      = useState("");
+  const inputRef = useRef();
+
+  function pick(f) {
+    if (!f || !f.type.startsWith("video/")) { setErr("Please select a video file."); return; }
+    setFile(f); setErr(""); setProgress(0); setPhase("");
+  }
+
+  async function upload() {
+    if (!file) return;
+    setErr(""); setProgress(0);
+
+    // Step 1 — get presigned URL
+    let jobId, uploadUrl;
+    try {
+      const res = await api.post("/upload/presign", {
+        filename: file.name, content_type: file.type, size_bytes: file.size,
+      });
+      jobId     = res.job_id;
+      uploadUrl = res.upload_url;
+    } catch (ex) { setErr(ex.message); return; }
+
+    // Step 2 — upload directly to GCS (or local internal endpoint)
+    setPhase("uploading");
+    await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.upload.onprogress = e => { if (e.lengthComputable) setProgress(Math.round(e.loaded/e.total*100)); };
+      xhr.onload  = () => xhr.status < 400 ? resolve() : reject(new Error(`Upload failed: ${xhr.status}`));
+      xhr.onerror = () => reject(new Error("Network error during upload"));
+      xhr.open("PUT", uploadUrl);
+      xhr.setRequestHeader("Content-Type", file.type);
+      xhr.send(file);
+    }).catch(ex => { setErr(ex.message); setPhase(""); throw ex; });
+
+    // Step 3 — confirm upload, trigger worker
+    setPhase("confirming");
+    try {
+      await api.post(`/jobs/${jobId}/confirm`, {});
+      onJobCreated(jobId);
+      setFile(null); setProgress(0); setPhase("");
+    } catch (ex) { setErr(ex.message); setPhase(""); }
+  }
+
+  const label = phase === "uploading"   ? `Uploading… ${progress}%`
+              : phase === "confirming"  ? "Queuing job…"
+              : file                    ? `Process "${file.name}"`
+              : "Select a video to start";
+
+  return (
+    <div>
+      <div
+        onClick={() => !phase && inputRef.current.click()}
+        onDragOver={e=>{ e.preventDefault(); setDrag(true); }}
+        onDragLeave={()=>setDrag(false)}
+        onDrop={e=>{ e.preventDefault(); setDrag(false); pick(e.dataTransfer.files[0]); }}
+        style={{
+          border:`2px dashed ${drag?"var(--accent2)":"var(--border)"}`,
+          borderRadius:12, padding:"2.5rem 2rem", textAlign:"center", cursor: phase?"default":"pointer",
+          background: drag?"rgba(124,58,237,.06)":"transparent", transition:"all .2s",
+        }}
+      >
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--accent2)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{marginBottom:12}}>
+          <polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/>
+          <path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/>
+        </svg>
+        <p style={{ color:"var(--text)", fontWeight:600 }}>
+          {file ? file.name : "Drop a video here or click to browse"}
+        </p>
+        {file && <p style={{ color:"var(--muted)", fontSize:".82rem", marginTop:4 }}>
+          {(file.size/1024/1024).toFixed(1)} MB · {file.type}
+        </p>}
       </div>
-      <div class="progress-label" id="progress-label"></div>
+      <input ref={inputRef} type="file" accept="video/*" style={{display:"none"}} onChange={e=>pick(e.target.files[0])}/>
+
+      {phase && <ProgressBar pct={progress}/>}
+      {err && <div style={S.error}>{err}</div>}
+
+      <div style={{ marginTop:"1rem" }}>
+        <button style={S.btn} onClick={upload} disabled={!file || !!phase}>
+          {label}
+        </button>
+      </div>
     </div>
+  );
+}
 
-    <!-- Clips -->
-    <div id="clips-section">
-      <h2>Detected Clips</h2>
-      <div id="clips-list"></div>
+// ── Clip Card ─────────────────────────────────────────────────────────────────
+function ClipCard({ clip }) {
+  const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,"0")}`;
+  const typeIcon = { single_face:"🎙", dual_face:"🎙🎙", no_face:"🎬" };
+  return (
+    <div style={{ background:"var(--surface)", border:"1px solid var(--border)", borderRadius:10, padding:".85rem 1rem", marginBottom:".5rem", display:"flex", gap:".75rem", alignItems:"flex-start" }}>
+      <div style={{ flexShrink:0 }}>
+        <div style={{ fontSize:".78rem", fontWeight:700, color:"var(--accent2)" }}>{fmt(clip.start_time)} – {fmt(clip.end_time)}</div>
+        <div style={{ marginTop:4, display:"flex", gap:6, flexWrap:"wrap" }}>
+          <Badge status={clip.status}/>
+          {clip.content_type && <span style={{ fontSize:".72rem", color:"var(--muted)" }}>{typeIcon[clip.content_type]} {clip.content_type.replace("_"," ")}</span>}
+          {clip.hook_score && <span style={{ fontSize:".72rem", color:"var(--yellow)", fontWeight:700 }}>⚡{clip.hook_score}/10</span>}
+        </div>
+      </div>
+      <p style={{ fontSize:".88rem", lineHeight:1.45, color:"var(--text)" }}>{clip.reason}</p>
     </div>
+  );
+}
 
-    <!-- Download -->
-    <button id="download-btn">Download 9:16 Clips (.zip)</button>
-  </div>
+// ── Job Row ───────────────────────────────────────────────────────────────────
+function JobRow({ job, onSelect }) {
+  const TERMINAL = ["complete","failed"];
+  const pct = { pending:5,uploading:8,downloading:12,transcribing:25,detecting:45,
+                reframing: job.clips_total ? 50+Math.round(job.clips_done/job.clips_total*45) : 55,
+                zipping:98,complete:100,failed:100 }[job.status] || 5;
 
-  <script src="/static/app.js"></script>
+  return (
+    <div
+      onClick={() => onSelect(job.id)}
+      style={{ background:"var(--surface)", border:"1px solid var(--border)", borderRadius:12, padding:"1rem 1.1rem", marginBottom:".6rem", cursor:"pointer", transition:"border-color .2s" }}
+      onMouseEnter={e=>e.currentTarget.style.borderColor="var(--accent)"}
+      onMouseLeave={e=>e.currentTarget.style.borderColor="var(--border)"}
+    >
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:8 }}>
+        <div style={{ minWidth:0 }}>
+          <div style={{ fontWeight:600, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{job.original_filename}</div>
+          <div style={{ fontSize:".8rem", color:"var(--muted)", marginTop:3 }}>{job.status_label}</div>
+        </div>
+        <div style={{ flexShrink:0, display:"flex", gap:8, alignItems:"center" }}>
+          <Badge status={job.status}/>
+          {job.status === "complete" && (
+            <button style={S.btnSm} onClick={e=>{ e.stopPropagation(); window.location.href=`/jobs/${job.id}/download`; }}>
+              Download
+            </button>
+          )}
+        </div>
+      </div>
+      {!TERMINAL.includes(job.status) && <ProgressBar pct={pct}/>}
+      {job.clips_total > 0 && (
+        <div style={{ fontSize:".78rem", color:"var(--muted)", marginTop:5 }}>
+          {job.clips_done} / {job.clips_total} clips
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Job Detail Panel ──────────────────────────────────────────────────────────
+function JobDetail({ jobId, onBack }) {
+  const [job, setJob] = useState(null);
+  const [err, setErr] = useState("");
+
+  const load = useCallback(async () => {
+    try { setJob(await api.get(`/jobs/${jobId}`)); }
+    catch (ex) { setErr(ex.message); }
+  }, [jobId]);
+
+  useEffect(() => {
+    load();
+    const TERMINAL = ["complete","failed"];
+    const iv = setInterval(() => {
+      if (job && TERMINAL.includes(job.status)) return;
+      load();
+    }, 5000);
+    return () => clearInterval(iv);
+  }, [load, job?.status]);
+
+  if (err)  return <div style={S.error}>{err} <button style={S.link} onClick={onBack}>Back</button></div>;
+  if (!job) return <p style={{ color:"var(--muted)" }}>Loading…</p>;
+
+  const pct = job.clips_total
+    ? 50 + Math.round(job.clips_done / job.clips_total * 45)
+    : { pending:5, transcribing:25, detecting:45, reframing:55, zipping:98, complete:100, failed:100 }[job.status] || 5;
+
+  return (
+    <div>
+      <button style={{ ...S.link, marginBottom:"1rem", fontSize:".9rem" }} onClick={onBack}>← Back</button>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:".75rem" }}>
+        <div>
+          <h2 style={{ fontWeight:700 }}>{job.original_filename}</h2>
+          <div style={{ color:"var(--muted)", fontSize:".85rem", marginTop:3 }}>{job.status_label}</div>
+        </div>
+        <Badge status={job.status}/>
+      </div>
+
+      {job.status !== "complete" && job.status !== "failed" && <ProgressBar pct={pct}/>}
+      {job.clips_total > 0 && (
+        <div style={{ fontSize:".82rem", color:"var(--muted)", marginTop:6, marginBottom:"1rem" }}>
+          Reframing {job.clips_done} / {job.clips_total} clips
+        </div>
+      )}
+
+      {job.error && <div style={S.error}>{job.error}</div>}
+
+      {job.status === "complete" && (
+        <button style={{ ...S.btnGreen, marginBottom:"1.5rem" }}
+          onClick={() => window.location.href=`/jobs/${job.id}/download`}>
+          Download {job.clips_done} Clips (.zip)
+        </button>
+      )}
+
+      {job.clips.length > 0 && (
+        <div>
+          <h3 style={{ fontSize:".8rem", fontWeight:700, color:"var(--muted)", textTransform:"uppercase", letterSpacing:".07em", marginBottom:".75rem" }}>
+            Detected Clips ({job.clips.length})
+          </h3>
+          {job.clips.map(c => <ClipCard key={c.id} clip={c}/>)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Dashboard ─────────────────────────────────────────────────────────────────
+function Dashboard({ onLogout }) {
+  const [jobs,      setJobs]      = useState([]);
+  const [selected,  setSelected]  = useState(null);
+  const [billing,   setBilling]   = useState(null);
+  const [tab,       setTab]       = useState("upload");   // "upload" | "jobs"
+
+  const loadJobs    = async () => { try { setJobs(await api.get("/jobs")); } catch {} };
+  const loadBilling = async () => { try { setBilling(await api.get("/billing")); } catch {} };
+
+  useEffect(() => { loadJobs(); loadBilling(); }, []);
+
+  // Poll jobs list every 5 s when there are active jobs
+  useEffect(() => {
+    const TERMINAL = ["complete","failed","uploading"];
+    const active = jobs.some(j => !TERMINAL.includes(j.status));
+    if (!active) return;
+    const iv = setInterval(loadJobs, 5000);
+    return () => clearInterval(iv);
+  }, [jobs]);
+
+  function onJobCreated(id) {
+    loadJobs();
+    setSelected(id);
+    setTab("jobs");
+  }
+
+  if (selected) {
+    return (
+      <div style={S.page}>
+        <header style={{ ...S.header, width:"100%", maxWidth:660 }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+            <h1 style={S.h1}>ViralClips</h1>
+            <button style={S.link} onClick={onLogout}>Sign out</button>
+          </div>
+        </header>
+        <div style={S.card}>
+          <JobDetail jobId={selected} onBack={()=>setSelected(null)}/>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={S.page}>
+      <header style={{ ...S.header, width:"100%", maxWidth:660 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+          <h1 style={S.h1}>ViralClips</h1>
+          <div style={{ display:"flex", gap:"1.2rem", alignItems:"center" }}>
+            {billing && (
+              <span style={{ fontSize:".82rem", color:"var(--muted)" }}>
+                {billing.tier === "free"
+                  ? `${billing.free_videos_remaining} free videos left`
+                  : `${Math.round(billing.paid_minutes_remaining)} min left`}
+              </span>
+            )}
+            <button style={S.link} onClick={onLogout}>Sign out</button>
+          </div>
+        </div>
+      </header>
+
+      <div style={S.card}>
+        {/* Tabs */}
+        <div style={{ display:"flex", gap:".25rem", marginBottom:"1.5rem", borderBottom:"1px solid var(--border)", paddingBottom:".75rem" }}>
+          {["upload","jobs"].map(t => (
+            <button key={t} onClick={()=>setTab(t)} style={{
+              padding:".4rem .9rem", borderRadius:8, border:"none", cursor:"pointer", fontWeight:600, fontSize:".9rem",
+              background: tab===t ? "var(--accent)" : "transparent",
+              color: tab===t ? "#fff" : "var(--muted)",
+            }}>
+              {t === "upload" ? "Upload" : `My Jobs (${jobs.length})`}
+            </button>
+          ))}
+        </div>
+
+        {tab === "upload" && (
+          <UploadZone onJobCreated={onJobCreated}/>
+        )}
+
+        {tab === "jobs" && (
+          jobs.length === 0
+            ? <p style={{ color:"var(--muted)", textAlign:"center", padding:"2rem 0" }}>No jobs yet. Upload a video to get started.</p>
+            : jobs.map(j => <JobRow key={j.id} job={j} onSelect={setSelected}/>)
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── App root ──────────────────────────────────────────────────────────────────
+function App() {
+  const [authed, setAuthed] = useState(!!localStorage.getItem("vc_token"));
+
+  function logout() {
+    localStorage.removeItem("vc_token");
+    setAuthed(false);
+  }
+
+  if (!authed) return <AuthPage onLogin={()=>setAuthed(true)}/>;
+  return <Dashboard onLogout={logout}/>;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
 </body>
 </html>

@@ -2,39 +2,53 @@
 ViralClips — FastAPI backend
 
 Endpoints:
-  POST /upload              Upload a video; returns {job_id}
-  GET  /jobs/{job_id}       Poll job status + clip metadata
-  GET  /jobs/{job_id}/download  Download finished zip
-  GET  /health              Liveness check
-  GET  /clips/{filename}    Serve extracted clip segments (used by Runway when PUBLIC_BASE_URL is set)
+  POST /auth/register
+  POST /auth/login
+  GET  /auth/me
+
+  POST /upload/presign          → {job_id, upload_url, gcs_path}
+  POST /jobs/{id}/confirm       → trigger worker after client finishes upload
+  GET  /jobs                    → list user jobs
+  GET  /jobs/{id}               → job status + clips
+  GET  /jobs/{id}/download      → redirect to signed download URL
+  GET  /billing                 → current usage
+
+  # Local dev only
+  PUT  /internal/upload/{id}    → receive raw video bytes (no GCS)
+  GET  /internal/download/{path:path}
 """
 
 import os
 import shutil
-import uuid
+from datetime import datetime
 from pathlib import Path
+from typing import List
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+import redis as _redis
+import rq
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
-from database import SessionLocal, engine
-from models import Base, Clip, Job
-from tasks import transcribe_video
+from auth import create_token, get_current_user, hash_password, verify_password
+from database import SessionLocal, engine, get_db
+from models import Base, Clip, Job, UsageRecord, User
+from schemas import (
+    ClipOut, JobOut, LoginRequest, PresignRequest, PresignResponse,
+    RegisterRequest, STATUS_LABELS, TokenResponse, UsageOut, UserOut,
+)
+from storage import (
+    LOCAL_OUTPUT_DIR, LOCAL_UPLOAD_DIR, generate_download_url, generate_upload_url,
+)
 
-# Bootstrap database
 Base.metadata.create_all(bind=engine)
 
-UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads"))
-OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "./outputs"))
-CLIPS_DIR = Path(os.getenv("CLIPS_DIR", "./clips"))
+LOCAL_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+LOCAL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-for _d in (UPLOAD_DIR, OUTPUT_DIR, CLIPS_DIR):
-    _d.mkdir(parents=True, exist_ok=True)
-
-app = FastAPI(title="ViralClips", version="1.0.0", docs_url="/docs")
+app = FastAPI(title="ViralClips", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,30 +57,82 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve extracted clips (needed when Runway fetches them via PUBLIC_BASE_URL)
-app.mount("/clips", StaticFiles(directory=str(CLIPS_DIR)), name="clips")
-
-# Serve the SPA
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# ── Redis / RQ ────────────────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# Dependency
-# ---------------------------------------------------------------------------
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+_redis_conn = _redis.from_url(os.environ["REDIS_URL"])
+_queue      = rq.Queue("viralclips", connection=_redis_conn)
 
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
+def enqueue_job(job_id: str):
+    _queue.enqueue("worker.process_job", job_id, job_timeout=3600)
 
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+FREE_VIDEO_LIMIT   = 3
+PAID_MINUTE_LIMIT  = 60.0  # per billing period
+
+def _current_period() -> str:
+    return datetime.utcnow().strftime("%Y-%m")
+
+
+def _get_usage(db: Session, user_id: str) -> UsageRecord:
+    period = _current_period()
+    usage  = (
+        db.query(UsageRecord)
+        .filter(UsageRecord.user_id == user_id, UsageRecord.billing_period == period)
+        .first()
+    )
+    if not usage:
+        usage = UsageRecord(user_id=user_id, billing_period=period)
+        db.add(usage)
+        db.commit()
+        db.refresh(usage)
+    return usage
+
+
+def _check_quota(user: User, db: Session):
+    usage = _get_usage(db, user.id)
+    if user.tier == "free" and usage.videos_processed >= FREE_VIDEO_LIMIT:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=f"Free tier limit reached ({FREE_VIDEO_LIMIT} videos/period). Upgrade to paid.",
+        )
+    # Paid: enforce by minutes_processed (checked after transcription in worker)
+
+
+def _job_to_out(job: Job, clips: list) -> JobOut:
+    clip_outs = [
+        ClipOut(
+            id=c.id,
+            start_time=c.start_time,
+            end_time=c.end_time,
+            duration=round(c.end_time - c.start_time, 1),
+            reason=c.reason,
+            hook_score=c.hook_score,
+            content_type=c.content_type,
+            status=c.status,
+        )
+        for c in sorted(clips, key=lambda x: x.start_time)
+    ]
+    return JobOut(
+        id=job.id,
+        status=job.status,
+        status_label=STATUS_LABELS.get(job.status, job.status),
+        original_filename=job.original_filename,
+        clips_total=job.clips_total,
+        clips_done=job.clips_done,
+        error=job.error,
+        download_ready=(job.status == "complete"),
+        created_at=job.created_at,
+        updated_at=job.updated_at,
+        clips=clip_outs,
+    )
+
+
+# ── Root ──────────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def index():
@@ -78,113 +144,184 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/upload", status_code=202)
-async def upload_video(file: UploadFile = File(...)):
-    """
-    Accept a video upload, persist it, record a Job row, and queue the
-    transcription task.  Returns the job_id immediately; client should poll
-    GET /jobs/{job_id} for progress.
-    """
-    content_type = file.content_type or ""
-    if not content_type.startswith("video/") and not file.filename.lower().endswith(
-        (".mp4", ".mov", ".avi", ".mkv", ".webm")
-    ):
-        raise HTTPException(status_code=400, detail="Only video files are accepted")
+# ── Auth ──────────────────────────────────────────────────────────────────────
 
-    job_id = str(uuid.uuid4())
-    suffix = Path(file.filename).suffix.lower() or ".mp4"
-    video_path = UPLOAD_DIR / f"{job_id}{suffix}"
+@app.post("/auth/register", response_model=TokenResponse, status_code=201)
+def register(req: RegisterRequest, db: Session = Depends(get_db)):
+    if db.query(User).filter(User.email == req.email).first():
+        raise HTTPException(status_code=409, detail="Email already registered")
+    if len(req.password) < 8:
+        raise HTTPException(status_code=422, detail="Password must be at least 8 characters")
 
-    with open(video_path, "wb") as out:
-        shutil.copyfileobj(file.file, out)
+    user = User(email=req.email, password_hash=hash_password(req.password))
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return TokenResponse(access_token=create_token(user.id))
 
+
+@app.post("/auth/login", response_model=TokenResponse)
+def login(req: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == req.email).first()
+    if not user or not verify_password(req.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    return TokenResponse(access_token=create_token(user.id))
+
+
+@app.get("/auth/me", response_model=UserOut)
+def me(user: User = Depends(get_current_user)):
+    return user
+
+
+# ── Upload ────────────────────────────────────────────────────────────────────
+
+@app.post("/upload/presign", response_model=PresignResponse, status_code=201)
+def presign(
+    req: PresignRequest,
+    user: User = Depends(get_current_user),
+    db: Session  = Depends(get_db),
+):
+    _check_quota(user, db)
+
+    job = Job(
+        user_id=user.id,
+        original_filename=req.filename,
+        status="uploading",
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    upload_url, gcs_path = generate_upload_url(job.id, req.filename, req.content_type)
+    job.gcs_input_path = gcs_path
+    db.commit()
+
+    return PresignResponse(job_id=job.id, upload_url=upload_url, gcs_path=gcs_path)
+
+
+@app.post("/jobs/{job_id}/confirm", status_code=202)
+def confirm_upload(
+    job_id: str,
+    user: User   = Depends(get_current_user),
+    db: Session  = Depends(get_db),
+):
+    """Called by client after the direct-to-GCS upload finishes."""
+    job = db.query(Job).filter(Job.id == job_id, Job.user_id == user.id).first()
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job.status != "uploading":
+        raise HTTPException(400, f"Unexpected job status: {job.status}")
+
+    job.status     = "pending"
+    job.updated_at = datetime.utcnow()
+    db.commit()
+
+    enqueue_job(job_id)
+    return {"job_id": job_id, "status": "pending"}
+
+
+# ── Jobs ──────────────────────────────────────────────────────────────────────
+
+@app.get("/jobs", response_model=List[JobOut])
+def list_jobs(
+    user: User  = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    jobs = (
+        db.query(Job)
+        .filter(Job.user_id == user.id)
+        .order_by(Job.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    return [_job_to_out(j, j.clips) for j in jobs]
+
+
+@app.get("/jobs/{job_id}", response_model=JobOut)
+def get_job(
+    job_id: str,
+    user: User  = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job = db.query(Job).filter(Job.id == job_id, Job.user_id == user.id).first()
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return _job_to_out(job, job.clips)
+
+
+@app.get("/jobs/{job_id}/download")
+def download_job(
+    job_id: str,
+    user: User  = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job = db.query(Job).filter(Job.id == job_id, Job.user_id == user.id).first()
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job.status != "complete":
+        raise HTTPException(400, f"Job is not complete (status: {job.status})")
+    if not job.gcs_output_path:
+        raise HTTPException(500, "Output not available")
+
+    url = generate_download_url(job.gcs_output_path)
+    return RedirectResponse(url)
+
+
+# ── Billing ───────────────────────────────────────────────────────────────────
+
+@app.get("/billing", response_model=UsageOut)
+def billing(
+    user: User  = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    usage = _get_usage(db, user.id)
+    return UsageOut(
+        tier=user.tier,
+        billing_period=usage.billing_period,
+        videos_processed=usage.videos_processed,
+        minutes_processed=round(usage.minutes_processed, 1),
+        free_videos_remaining=(
+            max(0, FREE_VIDEO_LIMIT - usage.videos_processed)
+            if user.tier == "free" else None
+        ),
+        paid_minutes_remaining=(
+            max(0.0, PAID_MINUTE_LIMIT - usage.minutes_processed)
+            if user.tier == "paid" else None
+        ),
+    )
+
+
+# ── Internal (local dev only) ─────────────────────────────────────────────────
+
+@app.put("/internal/upload/{job_id}")
+async def internal_upload(job_id: str, request: Request, filename: str = "video.mp4"):
+    """Receive raw video bytes for local dev (replaces GCS presigned PUT)."""
+    dest = LOCAL_UPLOAD_DIR / job_id
+    dest.mkdir(parents=True, exist_ok=True)
+    path = dest / filename
+
+    body = await request.body()
+    with open(path, "wb") as f:
+        f.write(body)
+
+    # Update job with local path
     db = SessionLocal()
     try:
-        job = Job(
-            id=job_id,
-            original_filename=file.filename,
-            video_path=str(video_path),
-            status="pending",
+        db.query(Job).filter(Job.id == job_id).update(
+            {"gcs_input_path": f"local://uploads/{job_id}/{filename}"}
         )
-        db.add(job)
         db.commit()
     finally:
         db.close()
 
-    transcribe_video.delay(job_id)
-
-    return {"job_id": job_id, "status": "pending"}
+    return {"stored": str(path)}
 
 
-@app.get("/jobs/{job_id}")
-def get_job(job_id: str, db: Session = Depends(get_db)):
-    """Poll job status, progress details, and clip metadata."""
-    job = db.query(Job).filter(Job.id == job_id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    clips = db.query(Clip).filter(Clip.job_id == job_id).order_by(Clip.start_time).all()
-
-    status_label = {
-        "pending": "Queued",
-        "transcribing": "Transcribing audio…",
-        "detecting": "Detecting viral moments…",
-        "reframing": "Reframing clips to 9:16…",
-        "complete": "Done",
-        "failed": "Failed",
-    }.get(job.status, job.status)
-
-    clips_done = sum(1 for c in clips if c.status == "complete")
-    clips_total = len(clips)
-
-    return {
-        "job_id": job.id,
-        "status": job.status,
-        "status_label": status_label,
-        "original_filename": job.original_filename,
-        "error": job.error,
-        "clips_done": clips_done,
-        "clips_total": clips_total,
-        "created_at": job.created_at.isoformat(),
-        "updated_at": job.updated_at.isoformat(),
-        "download_ready": job.status == "complete",
-        "clips": [
-            {
-                "id": c.id,
-                "start_time": c.start_time,
-                "end_time": c.end_time,
-                "duration": round(c.end_time - c.start_time, 1),
-                "reason": c.reason,
-                "status": c.status,
-            }
-            for c in clips
-        ],
-    }
-
-
-@app.get("/jobs/{job_id}/download")
-def download_clips(job_id: str, db: Session = Depends(get_db)):
-    """Stream the finished zip file of 9:16 clips."""
-    job = db.query(Job).filter(Job.id == job_id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if job.status != "complete":
-        raise HTTPException(
-            status_code=400,
-            detail=f"Job is not complete yet (status: {job.status})",
-        )
-
-    zip_path = OUTPUT_DIR / f"{job_id}_clips.zip"
-    if not zip_path.exists():
-        raise HTTPException(status_code=500, detail="Output zip not found on disk")
-
-    short_id = job_id[:8]
-    safe_name = "".join(
-        c if c.isalnum() or c in "-_." else "_"
-        for c in Path(job.original_filename).stem
-    )
-    return FileResponse(
-        str(zip_path),
-        media_type="application/zip",
-        filename=f"viralclips_{safe_name}_{short_id}.zip",
-    )
+@app.get("/internal/download/{path:path}")
+def internal_download(path: str):
+    """Serve local output files (dev only)."""
+    # path is like "outputs/job-id/clips.zip"
+    full = LOCAL_OUTPUT_DIR.parent / path
+    if not full.exists():
+        raise HTTPException(404, "File not found")
+    return FileResponse(str(full))

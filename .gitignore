@@ -9,9 +9,12 @@ venv/
 *.db
 *.db-shm
 *.db-wal
-data/
-uploads/
-outputs/
-clips/
-*.zip
+/tmp/
+node_modules/
 .DS_Store
+*.zip
+*.mp4
+*.mov
+*.avi
+*.mkv
+service-account*.json
