@@ -17,12 +17,20 @@ from datetime import datetime
 from pathlib import Path
 
 import requests
-import whisper
-from openai import OpenAI
 
 from celery_app import celery
 from database import SessionLocal
 from models import Clip, Job
+
+# Heavy deps imported lazily inside tasks so the API process can import this
+# module without needing torch/whisper installed in the API container.
+def _load_whisper():
+    import whisper  # noqa: PLC0415
+    return whisper
+
+def _openai_client():
+    from openai import OpenAI  # noqa: PLC0415
+    return OpenAI(api_key=OPENAI_API_KEY)
 
 log = logging.getLogger(__name__)
 
@@ -41,8 +49,6 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 RUNWAY_BASE_URL = "https://api.runwayml.com/v1"
 # Runway Gen-3 supports 5 s or 10 s output per task
 RUNWAY_MAX_SECONDS = 10
-
-_openai = OpenAI(api_key=OPENAI_API_KEY)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -182,7 +188,7 @@ def transcribe_video(self, job_id: str):
         db.commit()
 
         log.info("Loading Whisper model for job %s", job_id)
-        model = whisper.load_model("base")
+        model = _load_whisper().load_model("base")
         result = model.transcribe(job.video_path, verbose=False)
 
         transcript_data = {
@@ -261,7 +267,7 @@ Reply with valid JSON only — no markdown, no explanation:
   ]
 }}"""
 
-        response = _openai.chat.completions.create(
+        response = _openai_client().chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
