@@ -1,5 +1,5 @@
 """
-ViralClips Worker — Piece 1: Config, DB, GCS
+ViralClips Worker — Pieces 1 + 2: Config, DB, GCS, Content Classification
 """
 
 import logging
@@ -161,3 +161,81 @@ def storage_upload(local_path: Path, storage_path: str) -> str:
     blob.upload_from_filename(str(local_path))
     log.info("Uploaded to GCS: %s (%.1f MB)", blob_name, local_path.stat().st_size/1e6)
     return f"gs://{GCS_BUCKET}/{blob_name}"
+
+
+# ── Piece 2: Content Classification ──────────────────────────────────────────
+#
+# Strategy:
+#   Sample 10 evenly-spaced frames from the clip segment.
+#   Run MediaPipe Face Detection on each frame.
+#   Average the face count across samples:
+#     avg >= 1.8  →  dual_face   (podcast / interview — two people visible)
+#     avg >= 0.5  →  single_face (vlog, tutorial, talking head)
+#     avg <  0.5  →  no_face     (scenery, screen share, gameplay)
+#
+# We keep the MediaPipe detector alive for the whole classification pass
+# (creating it once is much faster than per-frame init).
+
+import cv2
+import mediapipe as mp
+import numpy as np
+
+_mp_face = mp.solutions.face_detection
+
+
+def _detect_faces(frame_bgr: np.ndarray, detector) -> list:
+    """Run MediaPipe face detection on one BGR frame. Returns list of detections."""
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    result = detector.process(rgb)
+    return result.detections or []
+
+
+def _sample_frames(video_path: str, start: float, end: float, n: int = 10) -> list:
+    """
+    Return n evenly-spaced BGR frames from [start, end] seconds of video_path.
+    Skips frames that can't be decoded rather than crashing.
+    """
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    frames = []
+
+    for i in range(n):
+        t = start + (end - start) * i / max(n - 1, 1)
+        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+        ok, frame = cap.read()
+        if ok:
+            frames.append(frame)
+
+    cap.release()
+    return frames
+
+
+def classify_content(video_path: str, start: float, end: float) -> str:
+    """
+    Return one of: 'single_face' | 'dual_face' | 'no_face'
+
+    Samples 10 frames from the clip window and counts faces per frame
+    using MediaPipe. The average count determines the layout strategy.
+    """
+    frames = _sample_frames(video_path, start, end, n=10)
+    if not frames:
+        log.warning("classify_content: no frames decoded — defaulting to no_face")
+        return "no_face"
+
+    face_counts = []
+    with _mp_face.FaceDetection(min_detection_confidence=0.5) as detector:
+        for frame in frames:
+            faces = _detect_faces(frame, detector)
+            face_counts.append(len(faces))
+
+    avg = sum(face_counts) / len(face_counts)
+    log.info(
+        "classify_content [%.1fs–%.1fs]: face counts=%s avg=%.2f",
+        start, end, face_counts, avg,
+    )
+
+    if avg >= 1.8:
+        return "dual_face"
+    if avg >= 0.5:
+        return "single_face"
+    return "no_face"
