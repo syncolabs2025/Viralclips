@@ -28,7 +28,7 @@ DATABASE_URL="postgresql://viralclips:PASSWORD@/viralclips?host=/cloudsql/$PROJE
 REDIS_URL="redis://MEMORYSTORE_IP:6379/0"
 GCS_BUCKET="your-viralclips-bucket"
 OPENAI_API_KEY="sk-..."
-SENDGRID_API_KEY="SG...."
+RESEND_API_KEY="re_..."
 JWT_SECRET="$(openssl rand -hex 32)"
 
 # ── Step 1: Create Artifact Registry repo (idempotent) ────────────────────────
@@ -64,7 +64,7 @@ gcloud run deploy viralclips-api \
 REDIS_URL=$REDIS_URL,\
 GCS_BUCKET=$GCS_BUCKET,\
 OPENAI_API_KEY=$OPENAI_API_KEY,\
-SENDGRID_API_KEY=$SENDGRID_API_KEY,\
+RESEND_API_KEY=$RESEND_API_KEY,\
 JWT_SECRET=$JWT_SECRET,\
 JWT_ALGORITHM=HS256" \
     --add-cloudsql-instances="$PROJECT_ID:$REGION:viralclips"
@@ -91,7 +91,7 @@ gcloud run jobs update viralclips-worker \
 REDIS_URL=$REDIS_URL,\
 GCS_BUCKET=$GCS_BUCKET,\
 OPENAI_API_KEY=$OPENAI_API_KEY,\
-SENDGRID_API_KEY=$SENDGRID_API_KEY,\
+RESEND_API_KEY=$RESEND_API_KEY,\
 JWT_SECRET=$JWT_SECRET" \
     --add-cloudsql-instances="$PROJECT_ID:$REGION:viralclips" \
     2>/dev/null || \
@@ -109,7 +109,7 @@ gcloud run jobs create viralclips-worker \
 REDIS_URL=$REDIS_URL,\
 GCS_BUCKET=$GCS_BUCKET,\
 OPENAI_API_KEY=$OPENAI_API_KEY,\
-SENDGRID_API_KEY=$SENDGRID_API_KEY,\
+RESEND_API_KEY=$RESEND_API_KEY,\
 JWT_SECRET=$JWT_SECRET" \
     --add-cloudsql-instances="$PROJECT_ID:$REGION:viralclips"
 

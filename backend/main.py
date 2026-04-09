@@ -91,35 +91,36 @@ def enqueue_job(job_id: str):
 
 # ── Email helpers ─────────────────────────────────────────────────────────────
 
-SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
-FROM_EMAIL       = os.getenv("FROM_EMAIL", "noreply@viralclips.app")
-API_BASE_URL     = os.getenv("API_BASE_URL", "http://localhost:8000")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+FROM_EMAIL     = os.getenv("FROM_EMAIL", "noreply@viralclips.app")
+API_BASE_URL   = os.getenv("API_BASE_URL", "http://localhost:8000")
+
+# Set EMAIL_VERIFICATION_REQUIRED=false to skip verification gates in dev
+EMAIL_VERIFICATION_REQUIRED = os.getenv("EMAIL_VERIFICATION_REQUIRED", "true").lower() != "false"
 
 
 def _send_verification_email(email: str, token: str):
     verify_url = f"{API_BASE_URL}/auth/verify-email/{token}"
 
-    if not SENDGRID_API_KEY:
+    if not RESEND_API_KEY:
         # Local dev: just log the link — no email sent
         log.info("EMAIL VERIFICATION (dev mode) → %s", verify_url)
         return
 
     try:
-        import sendgrid                          # noqa: PLC0415
-        from sendgrid.helpers.mail import Mail  # noqa: PLC0415
+        import resend  # noqa: PLC0415
 
-        sg  = sendgrid.SendGridAPIClient(SENDGRID_API_KEY)
-        msg = Mail(
-            from_email   = FROM_EMAIL,
-            to_emails    = email,
-            subject      = "Verify your ViralClips account",
-            html_content = (
+        resend.api_key = RESEND_API_KEY
+        resend.Emails.send({
+            "from":    FROM_EMAIL,
+            "to":      [email],
+            "subject": "Verify your ViralClips account",
+            "html":    (
                 f"<p>Welcome to ViralClips!</p>"
                 f"<p><a href='{verify_url}'>Click here to verify your email</a></p>"
                 f"<p>This link does not expire.</p>"
             ),
-        )
-        sg.send(msg)
+        })
     except Exception as exc:
         log.warning("Failed to send verification email to %s: %s", email, exc)
 
@@ -212,14 +213,15 @@ def register(req: RegisterRequest, db: Session = Depends(get_db)):
     user  = User(
         email                    = req.email,
         password_hash            = hash_password(req.password),
-        email_verified           = False,
-        email_verification_token = token,
+        email_verified           = not EMAIL_VERIFICATION_REQUIRED,   # auto-verify in bypass mode
+        email_verification_token = None if not EMAIL_VERIFICATION_REQUIRED else token,
     )
     db.add(user)
     db.commit()
     db.refresh(user)
 
-    _send_verification_email(user.email, token)
+    if EMAIL_VERIFICATION_REQUIRED:
+        _send_verification_email(user.email, token)
 
     return TokenResponse(access_token=create_token(user.id))
 
@@ -282,7 +284,7 @@ def presign(
     db: Session = Depends(get_db),
 ):
     # ── Security gate 1: email must be verified ───────────────────────────────
-    if not user.email_verified:
+    if EMAIL_VERIFICATION_REQUIRED and not user.email_verified:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Please verify your email before uploading.",

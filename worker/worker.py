@@ -27,8 +27,8 @@ log = logging.getLogger("worker")
 DATABASE_URL  = os.environ["DATABASE_URL"]
 REDIS_URL     = os.environ["REDIS_URL"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
-FROM_EMAIL    = os.getenv("FROM_EMAIL", "noreply@viralclips.app")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+FROM_EMAIL     = os.getenv("FROM_EMAIL", "noreply@viralclips.app")
 
 GCS_BUCKET    = os.getenv("GCS_BUCKET", "")
 LOCAL_UPLOAD_DIR = Path(os.getenv("LOCAL_UPLOAD_DIR", "/tmp/viralclips/uploads"))
@@ -1243,25 +1243,23 @@ def _zip_and_upload(job: dict, clip_paths: list[tuple[str, Path]]) -> str:
 # ── Step 6: Email notification ────────────────────────────────────────────────
 
 def _notify(job: dict, n_clips: int):
-    if not SENDGRID_API_KEY or not job.get("user_email"):
+    if not RESEND_API_KEY or not job.get("user_email"):
         return
     try:
-        import sendgrid                                    # noqa: PLC0415
-        from sendgrid.helpers.mail import Mail            # noqa: PLC0415
+        import resend  # noqa: PLC0415
 
-        sg  = sendgrid.SendGridAPIClient(SENDGRID_API_KEY)
-        msg = Mail(
-            from_email    = FROM_EMAIL,
-            to_emails     = job["user_email"],
-            subject       = f"Your ViralClips are ready ({n_clips} clips)",
-            html_content  = (
+        resend.api_key = RESEND_API_KEY
+        resend.Emails.send({
+            "from":    FROM_EMAIL,
+            "to":      [job["user_email"]],
+            "subject": f"Your ViralClips are ready ({n_clips} clips)",
+            "html":    (
                 f"<p>Hi,</p>"
                 f"<p>Your video <strong>{job['original_filename']}</strong> has been processed.</p>"
                 f"<p>{n_clips} clip(s) reframed to 9:16 are ready to download.</p>"
                 f"<p><a href='https://viralclips.app/jobs/{job['id']}'>View &amp; Download</a></p>"
             ),
-        )
-        sg.send(msg)
+        })
         log.info("Email sent to %s", job["user_email"])
     except Exception as exc:
         log.warning("Email notification failed: %s", exc)   # non-fatal
