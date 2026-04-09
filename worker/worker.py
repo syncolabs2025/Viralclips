@@ -877,3 +877,193 @@ def reframe_dual_face(
     _mux_audio(vid_tmp, video_path, start, duration, output_path)
     os.unlink(vid_tmp)
     log.info("dual_face done → %s", output_path)
+
+
+# ── Piece 5: No-Face Saliency Reframing ──────────────────────────────────────
+#
+# For clips with no detectable face — scenery, travel vlogs, screen shares,
+# gameplay, product demos — we need to find *what is visually interesting*
+# rather than where a person is.
+#
+# Approach:
+#   1. Sample frames at 2 FPS (slower — saliency is expensive)
+#   2. Run OpenCV's SpectralResidual saliency on each sampled frame
+#      → produces a float32 heatmap the same size as the frame
+#   3. Find the centroid of the salient region (weighted average of pixel coords)
+#   4. Smooth centroids with a heavy EMA (alpha=0.08) — very slow movement,
+#      good for scenery and screen content which shouldn't jump around
+#   5. Interpolate to every frame, render with the same crop-and-pipe approach
+#
+# SpectralResidual is fast (CPU, <5 ms/frame) and works well for:
+#   - Screens / UI (high contrast edges = salient)
+#   - Scenery (sky vs foreground, focal subject)
+#   - Gameplay (player character, action area)
+#
+# It can struggle with uniform textures, but for those cases any crop is fine.
+
+
+def _saliency_centroid(frame_bgr: np.ndarray, saliency_detector) -> tuple[float, float]:
+    """
+    Run SpectralResidual saliency on frame_bgr.
+    Returns (cx, cy) pixel coords of the salient centroid.
+    Falls back to frame centre if saliency map is blank.
+    """
+    h, w = frame_bgr.shape[:2]
+
+    success, smap = saliency_detector.computeSaliency(frame_bgr)
+    if not success:
+        return w / 2, h / 2
+
+    # smap is float32 [0,1] — normalise and threshold at 60th percentile
+    smap = smap.squeeze().astype(np.float32)
+    thresh = np.percentile(smap, 60)
+    mask   = (smap >= thresh).astype(np.float32)
+
+    total = mask.sum()
+    if total < 1:
+        return w / 2, h / 2
+
+    ys, xs = np.mgrid[0:h, 0:w]
+    cx = float((xs * mask).sum() / total)
+    cy = float((ys * mask).sum() / total)
+    return cx, cy
+
+
+def _saliency_centres(
+    video_path: str,
+    start: float,
+    end: float,
+    detection_fps: float = 2.0,
+    ema_alpha: float     = 0.08,
+) -> list[tuple[float, float]]:
+    """
+    Return per-frame (cx, cy) for the salient region, smoothed with heavy EMA.
+
+    ema_alpha=0.08 means each new measurement only moves the centre 8% of the
+    way towards it — very stable for slow-moving scenery and screen content.
+    Increase to ~0.25 for faster-moving subjects (action/sports).
+    """
+    cap     = cv2.VideoCapture(video_path)
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    src_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+
+    total_frames = int((end - start) * src_fps)
+    step         = max(1, int(src_fps / detection_fps))
+
+    detector = cv2.saliency.StaticSaliencySpectralResidual_create()
+
+    # ── Sample frames at detection_fps ───────────────────────────────────────
+    raw_cx: dict[int, float] = {}
+    raw_cy: dict[int, float] = {}
+
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
+
+    for local_idx in range(total_frames):
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if local_idx % step != 0:
+            continue
+        cx, cy = _saliency_centroid(frame, detector)
+        raw_cx[local_idx] = cx
+        raw_cy[local_idx] = cy
+
+    cap.release()
+
+    if not raw_cx:
+        log.warning("_saliency_centres: no frames sampled, using centre")
+        return [(src_w / 2, src_h / 2)] * total_frames
+
+    # ── EMA smoothing over sampled keyframes ──────────────────────────────────
+    # Walk through keyframes in order; EMA state carries forward.
+    smoothed_cx: dict[int, float] = {}
+    smoothed_cy: dict[int, float] = {}
+    ema_x = ema_y = None
+
+    for i in sorted(raw_cx):
+        if ema_x is None:
+            ema_x, ema_y = raw_cx[i], raw_cy[i]
+        else:
+            ema_x = ema_alpha * raw_cx[i] + (1 - ema_alpha) * ema_x
+            ema_y = ema_alpha * raw_cy[i] + (1 - ema_alpha) * ema_y
+        smoothed_cx[i] = ema_x
+        smoothed_cy[i] = ema_y
+
+    # ── Linear interpolate keyframes → every frame ────────────────────────────
+    keyframes = sorted(smoothed_cx)
+    result    = []
+    for i in range(total_frames):
+        lo = max((k for k in keyframes if k <= i), default=keyframes[0])
+        hi = min((k for k in keyframes if k >= i), default=keyframes[-1])
+        if lo == hi:
+            result.append((smoothed_cx[lo], smoothed_cy[lo]))
+        else:
+            t  = (i - lo) / (hi - lo)
+            cx = smoothed_cx[lo] + t * (smoothed_cx[hi] - smoothed_cx[lo])
+            cy = smoothed_cy[lo] + t * (smoothed_cy[hi] - smoothed_cy[lo])
+            result.append((cx, cy))
+
+    return result
+
+
+def reframe_no_face(
+    video_path: str,
+    start: float,
+    end: float,
+    output_path: str,
+    watermark: bool = False,
+) -> None:
+    """
+    Reframe a no-face clip to 1080×1920 centred on the most salient region.
+    Uses SpectralResidual saliency + heavy EMA smoothing.
+    Writes final muxed file to output_path.
+    """
+    cap     = cv2.VideoCapture(video_path)
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    src_h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    src_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    cap.release()
+
+    # 9:16 crop window
+    crop_h = src_h
+    crop_w = int(src_h * OUT_W / OUT_H)
+    if crop_w > src_w:
+        crop_w = src_w
+        crop_h = int(src_w * OUT_H / OUT_W)
+
+    duration     = end - start
+    total_frames = int(duration * src_fps)
+
+    log.info(
+        "no_face reframe: %.1fs clip, crop=%dx%d, encoder=%s",
+        duration, crop_w, crop_h, _ENCODER,
+    )
+
+    centres = _saliency_centres(video_path, start, end)
+
+    vid_tmp = str(WORK_DIR / f"{os.path.basename(output_path)}.vidonly.mp4")
+    proc    = _open_ffmpeg_pipe(vid_tmp, OUT_W, OUT_H, src_fps)
+
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
+
+    for i in range(total_frames):
+        ok, frame = cap.read()
+        if not ok:
+            break
+        cx, cy = centres[i] if i < len(centres) else (src_w / 2, src_h / 2)
+        out    = _crop_frame(frame, cx, cy, crop_w, crop_h, OUT_W, OUT_H)
+        if watermark:
+            out = _add_watermark(out)
+        proc.stdin.write(out.tobytes())
+
+    proc.stdin.close()
+    proc.wait()
+    cap.release()
+
+    _mux_audio(vid_tmp, video_path, start, duration, output_path)
+    os.unlink(vid_tmp)
+    log.info("no_face done → %s", output_path)
