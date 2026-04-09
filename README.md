@@ -1,49 +1,79 @@
 # ViralClips
 
-Upload any long-form video and get AI-identified highlight clips reframed to 9:16 portrait (Reels / Shorts).
+Upload long-form video → AI extracts viral moments → reframes to 9:16 → zip download.
 
 ```
-Upload video → Whisper transcription → GPT-4o mini moment detection
-            → Runway ML 9:16 reframing (parallel) → download zip
+Upload (direct to GCS) → Whisper transcription → GPT-4o mini moment detection
+→ content classification → intelligent reframing → zip → email notification
 ```
+
+**Reframing strategies:**
+
+| Content type | Detection | Method |
+|---|---|---|
+| `single_face` | MediaPipe Face Detection | Kalman-filtered crop centred on largest face |
+| `dual_face` | MediaPipe Face Mesh + lip aperture | Stacked split — active speaker top 60%, listener bottom 40% |
+| `no_face` | OpenCV SpectralResidual saliency | EMA-smoothed crop centred on salient region |
 
 ---
 
-## Quick start (Docker Compose)
+## Quick start (local dev)
 
 ### 1. Clone and configure
 
 ```bash
-git clone <repo-url>
-cd viralclips
+git clone <repo-url> && cd viralclips
 cp .env.example .env
+# Edit .env — set OPENAI_API_KEY at minimum. Leave GCS_BUCKET empty for local storage.
 ```
 
-Edit `.env` and set your API keys:
-
-| Variable | Description |
-|---|---|
-| `OPENAI_API_KEY` | OpenAI key — used for Whisper and GPT-4o mini |
-| `RUNWAY_API_KEY` | Runway ML key — used for 9:16 reframing |
-| `REDIS_URL` | Leave as-is for local Docker Compose |
-| `PUBLIC_BASE_URL` | Optional. If set (e.g. `https://api.myapp.com`) Runway fetches clips via HTTP instead of inline base64. Required for very large clips. |
-
-### 2. Build and run
+### 2. Run with Docker Compose
 
 ```bash
 docker compose up --build
 ```
 
-Open **http://localhost:8000** in your browser.
+- API → http://localhost:8000
+- Postgres → localhost:5432
+- Redis → localhost:6379
+
+Schema is applied automatically on first boot via `docker-entrypoint-initdb.d`.
 
 ### 3. Scale workers
 
 ```bash
-# Run 4 workers in parallel
 docker compose up --scale worker=4
 ```
 
-Each worker independently picks tasks from Redis — no coordination needed.
+Each worker instance pulls jobs from the Redis queue independently.
+
+---
+
+## Architecture
+
+```
+Browser
+  │  PUT video (direct to GCS / local API)
+  │  POST /jobs/{id}/confirm
+  ▼
+FastAPI (Cloud Run Service)
+  │  enqueue job_id → Redis
+  ▼
+Redis Queue (RQ)
+  │  dequeue
+  ▼
+Worker (Cloud Run Job, NVIDIA L4)
+  ├─ Download video from GCS
+  ├─ Whisper API → transcript
+  ├─ GPT-4o mini → [start, end, reason, hook_score] × 5
+  ├─ For each clip:
+  │   ├─ classify_content()  → single_face / dual_face / no_face
+  │   ├─ reframe_single_face()  Kalman + face tracking
+  │   ├─ reframe_dual_face()   ASD + vstack
+  │   └─ reframe_no_face()     saliency + EMA
+  ├─ Zip clips → upload to GCS
+  └─ SendGrid email notification
+```
 
 ---
 
@@ -51,144 +81,149 @@ Each worker independently picks tasks from Redis — no coordination needed.
 
 ```
 viralclips/
-├── docker-compose.yml
-├── .env.example
-└── backend/
-    ├── Dockerfile
-    ├── requirements.txt
-    ├── main.py          # FastAPI — upload / status / download endpoints
-    ├── database.py      # SQLAlchemy engine + session
-    ├── models.py        # Job and Clip ORM models
-    ├── celery_app.py    # Celery + Redis config
-    ├── tasks.py         # Pipeline tasks (transcribe → detect → reframe → zip)
-    └── static/
-        ├── index.html   # SPA
-        └── app.js       # Upload + polling logic
+├── schema.sql              Postgres DDL (users, jobs, clips, usage_records)
+├── docker-compose.yml      Local dev: postgres + redis + api + worker
+├── clouddeploy.sh          GCP deployment script
+├── backend/
+│   ├── main.py             FastAPI — all endpoints
+│   ├── auth.py             JWT + bcrypt
+│   ├── models.py           SQLAlchemy ORM (Postgres)
+│   ├── database.py         Engine + session
+│   ├── schemas.py          Pydantic request/response models
+│   ├── storage.py          GCS / local storage abstraction
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   └── static/
+│       └── index.html      React SPA (CDN React, no build step)
+└── worker/
+    ├── worker.py           Full AI pipeline (6 pieces)
+    ├── Dockerfile          nvidia/cuda:12.1 base, NVENC support
+    └── requirements.txt
 ```
 
 ---
 
-## API
+## API reference
 
-### `POST /upload`
-
-Upload a video file. Returns immediately with a `job_id`.
-
+### Auth
 ```
-Content-Type: multipart/form-data
-Body: file=<video>
-
-Response 202:
-{ "job_id": "uuid", "status": "pending" }
+POST /auth/register   {email, password}  → {access_token}
+POST /auth/login      {email, password}  → {access_token}
+GET  /auth/me                            → {id, email, tier}
 ```
 
-### `GET /jobs/{job_id}`
+### Upload flow
+```
+POST /upload/presign  {filename, content_type, size_bytes}
+                      → {job_id, upload_url, gcs_path}
 
-Poll for job progress.
+# Client PUTs raw video bytes to upload_url (direct to GCS or local endpoint)
 
-```json
-{
-  "job_id": "...",
-  "status": "reframing",
-  "status_label": "Reframing clips to 9:16…",
-  "clips_done": 2,
-  "clips_total": 5,
-  "download_ready": false,
-  "clips": [
-    {
-      "id": "...",
-      "start_time": 42.1,
-      "end_time": 78.5,
-      "duration": 36.4,
-      "reason": "High-energy moment with a strong hook.",
-      "status": "complete"
-    }
-  ]
+POST /jobs/{job_id}/confirm              → {status: "pending"}
+```
+
+### Job polling (every 5 s)
+```
+GET /jobs/{job_id}   → {
+  status, status_label,
+  clips_total, clips_done,
+  clips: [{start_time, end_time, reason, hook_score, content_type, status}],
+  download_ready
 }
 ```
 
-Job `status` values: `pending → transcribing → detecting → reframing → complete | failed`
+Status values: `pending → downloading → transcribing → detecting → reframing → zipping → complete | failed`
 
-### `GET /jobs/{job_id}/download`
+### Download
+```
+GET /jobs/{job_id}/download  → 302 redirect to signed GCS URL (24 h TTL)
+```
 
-Returns the zip file of 9:16 mp4 clips. Only available when `status == "complete"`.
-
----
-
-## Pipeline detail
-
-### Task 1 — `transcribe_video`
-Runs **OpenAI Whisper** (`base` model) locally on the worker. Produces a JSON transcript with per-segment timestamps. Chains to Task 2.
-
-### Task 2 — `detect_viral_moments`
-Sends the timestamped transcript to **GPT-4o mini** with a prompt that identifies 3–7 standalone moments (15–60 s each) most likely to perform well as short-form content. Creates a `Clip` row per moment and fans out to Task 3 for each clip.
-
-### Task 3 — `reframe_clip`
-For each clip:
-1. **FFmpeg** cuts the raw segment from the source video.
-2. If the clip is longer than Runway's 10-second limit it is split into ≤10 s chunks.
-3. Each chunk is submitted to **Runway ML** `video_to_video` with `ratio: 768:1280` (9:16) and an outpainting prompt.
-4. Chunks are downloaded and concatenated back together with FFmpeg.
-5. Triggers Task 4 after completion.
-
-### Task 4 — `check_and_finalize`
-Idempotent check: once all clips are in a terminal state, zips the successful outputs and marks the job `complete`.
-
----
-
-## Deployment on Railway
-
-1. Push this repo to GitHub.
-2. Create a new Railway project → **Deploy from GitHub repo**.
-3. Add a **Redis** plugin (Railway Marketplace).
-4. Create **two services** pointing at the same repo:
-   - **API**: Start command `uvicorn main:app --host 0.0.0.0 --port $PORT`, root dir `backend/`
-   - **Worker**: Start command `celery -A celery_app.celery worker --loglevel=info --concurrency=2`, root dir `backend/`
-5. Set environment variables on both services (copy from `.env.example`).
-6. Set `PUBLIC_BASE_URL` to the Railway API service URL so Runway can fetch clips over HTTPS.
-7. Attach a **Volume** to both services at `/data` so uploads and outputs persist.
-
-> **Tip**: Scale the Worker service to multiple instances via Railway's replicas slider. Each replica handles tasks independently.
-
----
-
-## Local development (without Docker)
-
-```bash
-cd backend
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-
-# Terminal 1 — Redis
-redis-server
-
-# Terminal 2 — API
-uvicorn main:app --reload
-
-# Terminal 3 — Worker
-celery -A celery_app.celery worker --loglevel=info
+### Billing
+```
+GET /billing  → {tier, videos_processed, minutes_processed, free_videos_remaining}
 ```
 
 ---
 
-## Environment variables reference
+## Tiers
 
-| Variable | Default | Required |
+| | Free | Paid ($10/mo) |
 |---|---|---|
-| `OPENAI_API_KEY` | — | Yes |
-| `RUNWAY_API_KEY` | — | Yes |
-| `REDIS_URL` | `redis://localhost:6379/0` | Yes |
-| `DATABASE_URL` | `sqlite:///./viralclips.db` | No |
-| `UPLOAD_DIR` | `./uploads` | No |
-| `CLIPS_DIR` | `./clips` | No |
-| `OUTPUT_DIR` | `./outputs` | No |
-| `PUBLIC_BASE_URL` | _(empty — uses base64)_ | No |
+| Videos | 3 per period | Unlimited |
+| Input length | Up to 1 hour | Up to 1 hour |
+| Clips per video | Up to 5 | Up to 5 |
+| Output | Watermarked | Clean |
+| Email notification | ✓ | ✓ |
 
 ---
 
-## Notes
+## Environment variables
 
-- **Whisper model**: `base` is fast and accurate enough for moment detection. Swap to `small` or `medium` in `tasks.py` for better accuracy at the cost of speed/memory.
-- **Runway quota**: Each 9:16 reframe consumes one Runway generation. A 5-clip job = 5 generations (more if clips exceed 10 s each).
-- **SQLite vs Postgres**: SQLite with WAL mode works fine for a single-node deployment. For multi-node production, set `DATABASE_URL` to a Postgres connection string — no other code changes needed.
-- **GPU workers**: Replace the CPU PyTorch wheels in `requirements.txt` with CUDA wheels to accelerate Whisper significantly.
+| Variable | Required | Description |
+|---|---|---|
+| `DATABASE_URL` | Yes | Postgres connection string |
+| `REDIS_URL` | Yes | Redis connection string |
+| `OPENAI_API_KEY` | Yes | Whisper + GPT-4o mini |
+| `JWT_SECRET` | Yes | Random string for JWT signing |
+| `GCS_BUCKET` | Prod only | GCS bucket name — leave empty for local dev |
+| `SENDGRID_API_KEY` | Optional | Email notifications |
+| `FROM_EMAIL` | Optional | Sender address for notifications |
+| `LOCAL_UPLOAD_DIR` | Dev only | Local upload path (default `/tmp/viralclips/uploads`) |
+| `LOCAL_OUTPUT_DIR` | Dev only | Local output path (default `/tmp/viralclips/outputs`) |
+| `API_BASE_URL` | Dev only | Used to build local upload URLs |
+
+---
+
+## Cloud Run GPU deployment
+
+```bash
+# Edit PROJECT_ID, DATABASE_URL, REDIS_URL, GCS_BUCKET in clouddeploy.sh first
+chmod +x clouddeploy.sh && ./clouddeploy.sh
+```
+
+The script:
+1. Creates an Artifact Registry Docker repo
+2. Builds + pushes API and Worker images
+3. Deploys API as a Cloud Run **Service** (always-on, auto-scales to 10)
+4. Deploys Worker as a Cloud Run **Job** (L4 GPU, 16 GB RAM, 1-hour timeout)
+
+Workers are triggered by the RQ queue — they start when there's a job and Cloud Run scales to zero between jobs.
+
+### GCP services needed
+
+| Service | Purpose |
+|---|---|
+| Cloud Run | API service + GPU worker jobs |
+| Artifact Registry | Docker image storage |
+| Cloud SQL (Postgres 16) | Job metadata |
+| Memorystore (Redis) | RQ job queue |
+| Cloud Storage | Video input + clip output |
+| Cloud SQL Auth Proxy | Secure DB connections |
+
+---
+
+## Local dev without GCS
+
+When `GCS_BUCKET` is unset:
+- Upload URLs point to `POST /internal/upload/{job_id}` on the API server
+- Files are stored under `LOCAL_UPLOAD_DIR` / `LOCAL_OUTPUT_DIR`
+- Downloads served from `GET /internal/download/{path}`
+
+The frontend and worker code is identical — only the storage layer switches.
+
+---
+
+## Worker packages
+
+| Package | Purpose |
+|---|---|
+| `openai` | Whisper API + GPT-4o mini |
+| `opencv-python-headless` | Video decode, saliency, frame processing |
+| `mediapipe` | Face detection, Face Mesh, lip landmarks |
+| `light-asd` | Active speaker detection (optional, graceful fallback) |
+| `ffmpeg` (system) | Encode 9:16 clips — NVENC on GPU, libx264 on CPU |
+| `rq` | Redis-based task queue |
+| `psycopg2-binary` | Direct Postgres access (no ORM overhead in worker) |
+| `sendgrid` | Email notifications |
+| `torch` | Required by MediaPipe |

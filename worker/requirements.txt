@@ -1,0 +1,15 @@
+openai==1.58.1
+opencv-python-headless==4.10.0.84
+mediapipe==0.10.18
+ffmpeg-python==0.2.0
+google-cloud-storage==2.19.0
+psycopg2-binary==2.9.10
+redis==5.2.1
+rq==2.1.0
+sendgrid==6.11.0
+numpy==1.26.4
+# torch + torchvision — CPU wheels used here; swap for CUDA in prod (see Dockerfile)
+torch==2.5.1
+torchvision==0.20.1
+# Active speaker detection (optional — fallback to lip-aperture if absent)
+light-asd==1.0.3
