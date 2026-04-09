@@ -3,9 +3,12 @@
 # Deploys the worker as a Cloud Run Job with NVIDIA L4 GPU (us-central1).
 # The API server is deployed as a Cloud Run Service (no GPU needed).
 #
+# Database: Supabase (managed Postgres — no Cloud SQL needed)
+# Queue:    Upstash Redis (serverless — no Memorystore needed)
+#
 # Prerequisites:
 #   gcloud auth login && gcloud auth configure-docker
-#   Enable APIs: Cloud Run, Artifact Registry, Cloud SQL, Redis (Memorystore)
+#   Enable APIs: Cloud Run, Artifact Registry
 #
 # Usage:
 #   chmod +x clouddeploy.sh
@@ -23,12 +26,16 @@ IMAGE_TAG="$(git rev-parse --short HEAD)"
 API_IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/api:$IMAGE_TAG"
 WORKER_IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/worker:$IMAGE_TAG"
 
-# These should already exist — create via Cloud Console or gcloud CLI
-DATABASE_URL="postgresql://viralclips:PASSWORD@/viralclips?host=/cloudsql/$PROJECT_ID:$REGION:viralclips"
-REDIS_URL="redis://MEMORYSTORE_IP:6379/0"
+# Supabase: use the Session Mode pooler URL (port 5432) for the worker (long-lived),
+# and the Transaction Mode pooler URL (port 6543) for the API (Cloud Run, stateless).
+DATABASE_URL="postgresql://postgres.[ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres"
+# Upstash: copy the TLS URL from your Upstash console (starts with rediss://)
+REDIS_URL="rediss://default:[password]@[endpoint].upstash.io:6379"
+
 GCS_BUCKET="your-viralclips-bucket"
 OPENAI_API_KEY="sk-..."
 RESEND_API_KEY="re_..."
+FROM_EMAIL="noreply@viralclips.app"
 JWT_SECRET="$(openssl rand -hex 32)"
 
 # ── Step 1: Create Artifact Registry repo (idempotent) ────────────────────────
@@ -65,9 +72,10 @@ REDIS_URL=$REDIS_URL,\
 GCS_BUCKET=$GCS_BUCKET,\
 OPENAI_API_KEY=$OPENAI_API_KEY,\
 RESEND_API_KEY=$RESEND_API_KEY,\
+FROM_EMAIL=$FROM_EMAIL,\
 JWT_SECRET=$JWT_SECRET,\
-JWT_ALGORITHM=HS256" \
-    --add-cloudsql-instances="$PROJECT_ID:$REGION:viralclips"
+JWT_ALGORITHM=HS256,\
+EMAIL_VERIFICATION_REQUIRED=true"
 
 API_URL=$(gcloud run services describe viralclips-api \
     --region="$REGION" --format="value(status.url)")
@@ -92,8 +100,8 @@ REDIS_URL=$REDIS_URL,\
 GCS_BUCKET=$GCS_BUCKET,\
 OPENAI_API_KEY=$OPENAI_API_KEY,\
 RESEND_API_KEY=$RESEND_API_KEY,\
+FROM_EMAIL=$FROM_EMAIL,\
 JWT_SECRET=$JWT_SECRET" \
-    --add-cloudsql-instances="$PROJECT_ID:$REGION:viralclips" \
     2>/dev/null || \
 gcloud run jobs create viralclips-worker \
     --image="$WORKER_IMAGE" \
@@ -110,8 +118,8 @@ REDIS_URL=$REDIS_URL,\
 GCS_BUCKET=$GCS_BUCKET,\
 OPENAI_API_KEY=$OPENAI_API_KEY,\
 RESEND_API_KEY=$RESEND_API_KEY,\
-JWT_SECRET=$JWT_SECRET" \
-    --add-cloudsql-instances="$PROJECT_ID:$REGION:viralclips"
+FROM_EMAIL=$FROM_EMAIL,\
+JWT_SECRET=$JWT_SECRET"
 
 # ── Step 6: Apply GCS lifecycle rules ────────────────────────────────────────
 # uploads/ deleted after 2 days  — raw input videos don't need to persist
@@ -133,5 +141,5 @@ echo "  Worker: viralclips-worker (triggered per job via RQ)"
 echo ""
 echo "Next steps:"
 echo "  1. Update API_BASE_URL in your .env to $API_URL"
-echo "  2. Run schema.sql against your Cloud SQL instance"
+echo "  2. Run schema.sql in Supabase SQL editor (Dashboard → SQL Editor)"
 echo "  3. Set a GCP billing budget alert (see above)"
