@@ -21,6 +21,7 @@ class UserOut(BaseModel):
     id: str
     email: str
     tier: str
+    email_verified: bool
     created_at: datetime
 
     class Config:

@@ -147,7 +147,7 @@ function AuthPage({ onLogin }) {
 }
 
 // ── Upload Zone ───────────────────────────────────────────────────────────────
-function UploadZone({ onJobCreated }) {
+function UploadZone({ onJobCreated, emailVerified }) {
   const [drag,     setDrag]     = useState(false);
   const [file,     setFile]     = useState(null);
   const [progress, setProgress] = useState(0);   // 0-100
@@ -195,9 +195,11 @@ function UploadZone({ onJobCreated }) {
     } catch (ex) { setErr(ex.message); setPhase(""); }
   }
 
-  const label = phase === "uploading"   ? `Uploading… ${progress}%`
-              : phase === "confirming"  ? "Queuing job…"
-              : file                    ? `Process "${file.name}"`
+  const notVerified = emailVerified === false;
+  const label = notVerified            ? "Verify your email to upload"
+              : phase === "uploading"  ? `Uploading… ${progress}%`
+              : phase === "confirming" ? "Queuing job…"
+              : file                   ? `Process "${file.name}"`
               : "Select a video to start";
 
   return (
@@ -230,7 +232,8 @@ function UploadZone({ onJobCreated }) {
       {err && <div style={S.error}>{err}</div>}
 
       <div style={{ marginTop:"1rem" }}>
-        <button style={S.btn} onClick={upload} disabled={!file || !!phase}>
+        <button style={{ ...S.btn, ...(notVerified ? { background:"var(--muted)", cursor:"not-allowed" } : {}) }}
+          onClick={upload} disabled={!file || !!phase || notVerified}>
           {label}
         </button>
       </div>
@@ -362,7 +365,7 @@ function JobDetail({ jobId, onBack }) {
 }
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
-function Dashboard({ onLogout }) {
+function Dashboard({ onLogout, emailVerified }) {
   const [jobs,      setJobs]      = useState([]);
   const [selected,  setSelected]  = useState(null);
   const [billing,   setBilling]   = useState(null);
@@ -437,7 +440,7 @@ function Dashboard({ onLogout }) {
         </div>
 
         {tab === "upload" && (
-          <UploadZone onJobCreated={onJobCreated}/>
+          <UploadZone onJobCreated={onJobCreated} emailVerified={emailVerified}/>
         )}
 
         {tab === "jobs" && (
@@ -450,17 +453,93 @@ function Dashboard({ onLogout }) {
   );
 }
 
+// ── Email verification banner ─────────────────────────────────────────────────
+function VerificationBanner({ email }) {
+  const [sent,  setSent]  = useState(false);
+  const [busy,  setBusy]  = useState(false);
+
+  async function resend() {
+    setBusy(true);
+    try {
+      await api.post("/auth/resend-verification", {});
+      setSent(true);
+    } catch {}
+    finally { setBusy(false); }
+  }
+
+  return (
+    <div style={{
+      width:"100%", maxWidth:660, marginBottom:"1rem",
+      padding:".85rem 1rem",
+      background:"rgba(245,158,11,.1)", border:"1px solid rgba(245,158,11,.3)",
+      borderRadius:10, display:"flex", justifyContent:"space-between",
+      alignItems:"center", gap:"1rem",
+    }}>
+      <span style={{ fontSize:".88rem", color:"var(--yellow)" }}>
+        ⚠️ Please verify your email (<strong>{email}</strong>) to start uploading.
+      </span>
+      {sent
+        ? <span style={{ fontSize:".82rem", color:"var(--green)" }}>Sent ✓</span>
+        : <button style={{ ...S.btnSm, background:"var(--yellow)", color:"#000", flexShrink:0 }}
+            onClick={resend} disabled={busy}>
+            {busy ? "…" : "Resend"}
+          </button>
+      }
+    </div>
+  );
+}
+
 // ── App root ──────────────────────────────────────────────────────────────────
 function App() {
-  const [authed, setAuthed] = useState(!!localStorage.getItem("vc_token"));
+  const [authed,   setAuthed]   = useState(!!localStorage.getItem("vc_token"));
+  const [user,     setUser]     = useState(null);
+  const [verified, setVerified] = useState(null);  // null = unknown, true/false
+
+  // Check ?verified=1 in URL (redirected from email link)
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("verified") === "1") {
+      setVerified(true);
+      window.history.replaceState({}, "", "/");
+    }
+  }, []);
+
+  // Load user once logged in
+  useEffect(() => {
+    if (!authed) return;
+    api.get("/auth/me")
+      .then(u => { setUser(u); setVerified(u.email_verified); })
+      .catch(() => { localStorage.removeItem("vc_token"); setAuthed(false); });
+  }, [authed]);
 
   function logout() {
     localStorage.removeItem("vc_token");
     setAuthed(false);
+    setUser(null);
+    setVerified(null);
   }
 
   if (!authed) return <AuthPage onLogin={()=>setAuthed(true)}/>;
-  return <Dashboard onLogout={logout}/>;
+
+  return (
+    <>
+      {verified === false && user && (
+        <div style={{ display:"flex", justifyContent:"center", padding:"1rem 1rem 0" }}>
+          <VerificationBanner email={user.email}/>
+        </div>
+      )}
+      {verified === true && (
+        <div style={{
+          textAlign:"center", padding:".6rem", fontSize:".85rem",
+          background:"rgba(34,197,94,.1)", color:"var(--green)",
+          borderBottom:"1px solid rgba(34,197,94,.2)",
+        }}>
+          ✓ Email verified — you're all set!
+        </div>
+      )}
+      <Dashboard onLogout={logout} emailVerified={verified !== false}/>
+    </>
+  );
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App/>);

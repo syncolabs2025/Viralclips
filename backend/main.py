@@ -5,6 +5,8 @@ Endpoints:
   POST /auth/register
   POST /auth/login
   GET  /auth/me
+  GET  /auth/verify-email/{token}
+  POST /auth/resend-verification
 
   POST /upload/presign          → {job_id, upload_url, gcs_path}
   POST /jobs/{id}/confirm       → trigger worker after client finishes upload
@@ -18,7 +20,9 @@ Endpoints:
   GET  /internal/download/{path:path}
 """
 
+import logging
 import os
+import secrets
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -26,9 +30,9 @@ from typing import List
 
 import redis as _redis
 import rq
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
@@ -40,9 +44,11 @@ from schemas import (
     RegisterRequest, STATUS_LABELS, TokenResponse, UsageOut, UserOut,
 )
 from storage import (
-    LOCAL_OUTPUT_DIR, LOCAL_UPLOAD_DIR, generate_download_url, generate_upload_url,
+    LOCAL_OUTPUT_DIR, LOCAL_UPLOAD_DIR, MAX_UPLOAD_BYTES,
+    generate_download_url, generate_upload_url,
 )
 
+log = logging.getLogger("api")
 Base.metadata.create_all(bind=engine)
 
 LOCAL_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -59,6 +65,20 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# ── Allowed file types ────────────────────────────────────────────────────────
+# Both MIME type AND extension must match — prevents renaming .exe to .mp4
+
+ALLOWED_MIME_TYPES = {
+    "video/mp4", "video/quicktime", "video/x-msvideo",
+    "video/x-matroska", "video/webm", "video/mpeg",
+    "video/3gpp", "video/x-flv", "video/x-ms-wmv",
+}
+
+ALLOWED_EXTENSIONS = {
+    ".mp4", ".mov", ".avi", ".mkv", ".webm",
+    ".mpeg", ".mpg", ".3gp", ".flv", ".wmv",
+}
+
 # ── Redis / RQ ────────────────────────────────────────────────────────────────
 
 _redis_conn = _redis.from_url(os.environ["REDIS_URL"])
@@ -69,10 +89,46 @@ def enqueue_job(job_id: str):
     _queue.enqueue("worker.process_job", job_id, job_timeout=3600)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Email helpers ─────────────────────────────────────────────────────────────
 
-FREE_VIDEO_LIMIT   = 3
-PAID_MINUTE_LIMIT  = 60.0  # per billing period
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
+FROM_EMAIL       = os.getenv("FROM_EMAIL", "noreply@viralclips.app")
+API_BASE_URL     = os.getenv("API_BASE_URL", "http://localhost:8000")
+
+
+def _send_verification_email(email: str, token: str):
+    verify_url = f"{API_BASE_URL}/auth/verify-email/{token}"
+
+    if not SENDGRID_API_KEY:
+        # Local dev: just log the link — no email sent
+        log.info("EMAIL VERIFICATION (dev mode) → %s", verify_url)
+        return
+
+    try:
+        import sendgrid                          # noqa: PLC0415
+        from sendgrid.helpers.mail import Mail  # noqa: PLC0415
+
+        sg  = sendgrid.SendGridAPIClient(SENDGRID_API_KEY)
+        msg = Mail(
+            from_email   = FROM_EMAIL,
+            to_emails    = email,
+            subject      = "Verify your ViralClips account",
+            html_content = (
+                f"<p>Welcome to ViralClips!</p>"
+                f"<p><a href='{verify_url}'>Click here to verify your email</a></p>"
+                f"<p>This link does not expire.</p>"
+            ),
+        )
+        sg.send(msg)
+    except Exception as exc:
+        log.warning("Failed to send verification email to %s: %s", email, exc)
+
+
+# ── Quota / billing helpers ───────────────────────────────────────────────────
+
+FREE_VIDEO_LIMIT  = 3
+PAID_MINUTE_LIMIT = 60.0
+
 
 def _current_period() -> str:
     return datetime.utcnow().strftime("%Y-%m")
@@ -100,7 +156,6 @@ def _check_quota(user: User, db: Session):
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail=f"Free tier limit reached ({FREE_VIDEO_LIMIT} videos/period). Upgrade to paid.",
         )
-    # Paid: enforce by minutes_processed (checked after transcription in worker)
 
 
 def _job_to_out(job: Job, clips: list) -> JobOut:
@@ -153,10 +208,19 @@ def register(req: RegisterRequest, db: Session = Depends(get_db)):
     if len(req.password) < 8:
         raise HTTPException(status_code=422, detail="Password must be at least 8 characters")
 
-    user = User(email=req.email, password_hash=hash_password(req.password))
+    token = secrets.token_urlsafe(32)
+    user  = User(
+        email                    = req.email,
+        password_hash            = hash_password(req.password),
+        email_verified           = False,
+        email_verification_token = token,
+    )
     db.add(user)
     db.commit()
     db.refresh(user)
+
+    _send_verification_email(user.email, token)
+
     return TokenResponse(access_token=create_token(user.id))
 
 
@@ -173,21 +237,85 @@ def me(user: User = Depends(get_current_user)):
     return user
 
 
+@app.get("/auth/verify-email/{token}")
+def verify_email(token: str, db: Session = Depends(get_db)):
+    """
+    Clicked from the verification email link.
+    Marks the user verified, clears the token, redirects to the app.
+    """
+    user = db.query(User).filter(User.email_verification_token == token).first()
+    if not user:
+        # Token not found or already used — still redirect, don't leak info
+        return RedirectResponse("/?verified=invalid")
+
+    user.email_verified           = True
+    user.email_verification_token = None
+    user.updated_at               = datetime.utcnow()
+    db.commit()
+
+    return RedirectResponse("/?verified=1")
+
+
+@app.post("/auth/resend-verification", status_code=202)
+def resend_verification(
+    user: User  = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if user.email_verified:
+        raise HTTPException(400, "Email is already verified")
+
+    token                        = secrets.token_urlsafe(32)
+    user.email_verification_token = token
+    user.updated_at               = datetime.utcnow()
+    db.commit()
+
+    _send_verification_email(user.email, token)
+    return {"detail": "Verification email sent"}
+
+
 # ── Upload ────────────────────────────────────────────────────────────────────
 
 @app.post("/upload/presign", response_model=PresignResponse, status_code=201)
 def presign(
     req: PresignRequest,
-    user: User = Depends(get_current_user),
-    db: Session  = Depends(get_db),
+    user: User  = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
+    # ── Security gate 1: email must be verified ───────────────────────────────
+    if not user.email_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Please verify your email before uploading.",
+        )
+
+    # ── Security gate 2: quota check ──────────────────────────────────────────
     _check_quota(user, db)
 
-    job = Job(
-        user_id=user.id,
-        original_filename=req.filename,
-        status="uploading",
-    )
+    # ── Security gate 3: file size ────────────────────────────────────────────
+    if req.size_bytes < 1024:
+        raise HTTPException(400, "File is too small to be a valid video (< 1 KB)")
+    if req.size_bytes > MAX_UPLOAD_BYTES:
+        limit_gb = MAX_UPLOAD_BYTES / (1024 ** 3)
+        raise HTTPException(400, f"File exceeds the {limit_gb:.0f} GB upload limit")
+
+    # ── Security gate 4: MIME type whitelist ──────────────────────────────────
+    if req.content_type not in ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            400,
+            f"File type '{req.content_type}' is not allowed. "
+            f"Accepted: {', '.join(sorted(ALLOWED_MIME_TYPES))}",
+        )
+
+    # ── Security gate 5: file extension whitelist ─────────────────────────────
+    ext = Path(req.filename).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            400,
+            f"File extension '{ext}' is not allowed. "
+            f"Accepted: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+        )
+
+    job = Job(user_id=user.id, original_filename=req.filename, status="uploading")
     db.add(job)
     db.commit()
     db.refresh(job)
@@ -202,10 +330,9 @@ def presign(
 @app.post("/jobs/{job_id}/confirm", status_code=202)
 def confirm_upload(
     job_id: str,
-    user: User   = Depends(get_current_user),
-    db: Session  = Depends(get_db),
+    user: User  = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
-    """Called by client after the direct-to-GCS upload finishes."""
     job = db.query(Job).filter(Job.id == job_id, Job.user_id == user.id).first()
     if not job:
         raise HTTPException(404, "Job not found")
@@ -223,10 +350,7 @@ def confirm_upload(
 # ── Jobs ──────────────────────────────────────────────────────────────────────
 
 @app.get("/jobs", response_model=List[JobOut])
-def list_jobs(
-    user: User  = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
+def list_jobs(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     jobs = (
         db.query(Job)
         .filter(Job.user_id == user.id)
@@ -238,11 +362,7 @@ def list_jobs(
 
 
 @app.get("/jobs/{job_id}", response_model=JobOut)
-def get_job(
-    job_id: str,
-    user: User  = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
+def get_job(job_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     job = db.query(Job).filter(Job.id == job_id, Job.user_id == user.id).first()
     if not job:
         raise HTTPException(404, "Job not found")
@@ -250,11 +370,7 @@ def get_job(
 
 
 @app.get("/jobs/{job_id}/download")
-def download_job(
-    job_id: str,
-    user: User  = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
+def download_job(job_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     job = db.query(Job).filter(Job.id == job_id, Job.user_id == user.id).first()
     if not job:
         raise HTTPException(404, "Job not found")
@@ -262,18 +378,13 @@ def download_job(
         raise HTTPException(400, f"Job is not complete (status: {job.status})")
     if not job.gcs_output_path:
         raise HTTPException(500, "Output not available")
-
-    url = generate_download_url(job.gcs_output_path)
-    return RedirectResponse(url)
+    return RedirectResponse(generate_download_url(job.gcs_output_path))
 
 
 # ── Billing ───────────────────────────────────────────────────────────────────
 
 @app.get("/billing", response_model=UsageOut)
-def billing(
-    user: User  = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
+def billing(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     usage = _get_usage(db, user.id)
     return UsageOut(
         tier=user.tier,
@@ -281,12 +392,10 @@ def billing(
         videos_processed=usage.videos_processed,
         minutes_processed=round(usage.minutes_processed, 1),
         free_videos_remaining=(
-            max(0, FREE_VIDEO_LIMIT - usage.videos_processed)
-            if user.tier == "free" else None
+            max(0, FREE_VIDEO_LIMIT - usage.videos_processed) if user.tier == "free" else None
         ),
         paid_minutes_remaining=(
-            max(0.0, PAID_MINUTE_LIMIT - usage.minutes_processed)
-            if user.tier == "paid" else None
+            max(0.0, PAID_MINUTE_LIMIT - usage.minutes_processed) if user.tier == "paid" else None
         ),
     )
 
@@ -295,16 +404,22 @@ def billing(
 
 @app.put("/internal/upload/{job_id}")
 async def internal_upload(job_id: str, request: Request, filename: str = "video.mp4"):
-    """Receive raw video bytes for local dev (replaces GCS presigned PUT)."""
+    """Receive raw video bytes for local dev. Enforces the same size cap as GCS."""
+    content_length = int(request.headers.get("content-length", 0))
+    if content_length > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"File exceeds {MAX_UPLOAD_BYTES // (1024**3)} GB limit")
+
     dest = LOCAL_UPLOAD_DIR / job_id
     dest.mkdir(parents=True, exist_ok=True)
     path = dest / filename
 
     body = await request.body()
+    if len(body) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "File exceeds size limit")
+
     with open(path, "wb") as f:
         f.write(body)
 
-    # Update job with local path
     db = SessionLocal()
     try:
         db.query(Job).filter(Job.id == job_id).update(
@@ -319,8 +434,6 @@ async def internal_upload(job_id: str, request: Request, filename: str = "video.
 
 @app.get("/internal/download/{path:path}")
 def internal_download(path: str):
-    """Serve local output files (dev only)."""
-    # path is like "outputs/job-id/clips.zip"
     full = LOCAL_OUTPUT_DIR.parent / path
     if not full.exists():
         raise HTTPException(404, "File not found")

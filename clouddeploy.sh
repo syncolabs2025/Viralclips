@@ -113,10 +113,25 @@ SENDGRID_API_KEY=$SENDGRID_API_KEY,\
 JWT_SECRET=$JWT_SECRET" \
     --add-cloudsql-instances="$PROJECT_ID:$REGION:viralclips"
 
+# ── Step 6: Apply GCS lifecycle rules ────────────────────────────────────────
+# uploads/ deleted after 2 days  — raw input videos don't need to persist
+# outputs/ deleted after 30 days — gives users time to download their clips
+echo "▶ Applying GCS lifecycle rules…"
+gsutil lifecycle set gcs_lifecycle.json "gs://$GCS_BUCKET"
+
+# ── Step 7: Set up GCP Budget Alert (manual step — printed as reminder) ───────
 echo ""
+echo "⚠️  IMPORTANT: Set a billing budget alert in GCP Console:"
+echo "   Billing → Budgets & alerts → Create budget"
+echo "   Recommended: alert at \$50, \$100, \$200 with email + Pub/Sub notification"
+echo "   This protects against runaway GPU costs if the queue is flooded."
+echo ""
+
 echo "✓ Deployment complete"
 echo "  API:    $API_URL"
 echo "  Worker: viralclips-worker (triggered per job via RQ)"
 echo ""
-echo "Next: update API_BASE_URL in your .env to $API_URL"
-echo "      run schema.sql against your Cloud SQL instance"
+echo "Next steps:"
+echo "  1. Update API_BASE_URL in your .env to $API_URL"
+echo "  2. Run schema.sql against your Cloud SQL instance"
+echo "  3. Set a GCP billing budget alert (see above)"

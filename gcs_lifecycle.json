@@ -1,0 +1,20 @@
+{
+  "lifecycle": {
+    "rule": [
+      {
+        "action": { "type": "Delete" },
+        "condition": {
+          "age": 2,
+          "matchesPrefix": ["uploads/"]
+        }
+      },
+      {
+        "action": { "type": "Delete" },
+        "condition": {
+          "age": 30,
+          "matchesPrefix": ["outputs/"]
+        }
+      }
+    ]
+  }
+}

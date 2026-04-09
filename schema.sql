@@ -5,12 +5,14 @@ CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -- ── Users ────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS users (
-    id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    email           VARCHAR(255) UNIQUE NOT NULL,
-    password_hash   VARCHAR(255) NOT NULL,
-    tier            VARCHAR(20)  NOT NULL DEFAULT 'free',   -- free | paid
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    id                          UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    email                       VARCHAR(255) UNIQUE NOT NULL,
+    password_hash               VARCHAR(255) NOT NULL,
+    tier                        VARCHAR(20)  NOT NULL DEFAULT 'free',   -- free | paid
+    email_verified              BOOLEAN      NOT NULL DEFAULT FALSE,
+    email_verification_token    VARCHAR(100),                           -- NULL once verified
+    created_at                  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at                  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
 -- ── Jobs ─────────────────────────────────────────────────────────────────────
