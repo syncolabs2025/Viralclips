@@ -239,3 +239,304 @@ def classify_content(video_path: str, start: float, end: float) -> str:
     if avg >= 0.5:
         return "single_face"
     return "no_face"
+
+
+# ── Piece 3: Kalman Filter + Single-Face Reframing ────────────────────────────
+#
+# Pipeline for single_face clips:
+#   1. Detect the largest face at 5 FPS → raw (cx, cy) centres
+#   2. Fill gaps (frames with no detection) by holding the last known position
+#   3. Smooth x and y independently with a 1-D Kalman filter
+#   4. Interpolate the smoothed 5-FPS centres to every frame
+#   5. Pipe frames through FFmpeg: crop 9:16 window centred on the face,
+#      scale to 1080×1920, encode H.264 (NVENC if available)
+#
+# The Kalman filter is deliberately low-trust of new measurements
+# (high measurement noise) so the crop window glides rather than jerks.
+
+import subprocess
+
+
+# ── GPU detection ─────────────────────────────────────────────────────────────
+
+def _has_nvenc() -> bool:
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        return "h264_nvenc" in out
+    except Exception:
+        return False
+
+_ENCODER = "h264_nvenc" if _has_nvenc() else "libx264"
+log.info("Video encoder: %s", _ENCODER)
+
+
+# ── 1-D Kalman filter ─────────────────────────────────────────────────────────
+
+class _Kalman1D:
+    """
+    Minimal 1-D Kalman filter.
+    State  = [position, velocity]
+    Measurement = position only.
+
+    process_var   — how much the true position can drift between frames (low = smooth)
+    measure_var   — how much we trust each face-detection reading (high = smooth)
+    """
+
+    def __init__(self, process_var: float = 5.0, measure_var: float = 200.0):
+        self._x  = None          # estimated position
+        self._v  = 0.0           # estimated velocity
+        self._p  = 1e4           # error covariance
+        self._q  = process_var
+        self._r  = measure_var
+
+    def update(self, measurement: float) -> float:
+        if self._x is None:
+            self._x = measurement
+            return measurement
+
+        # Predict
+        x_pred = self._x + self._v
+        p_pred = self._p + self._q
+
+        # Update
+        k       = p_pred / (p_pred + self._r)
+        self._x = x_pred + k * (measurement - x_pred)
+        self._v = self._v + 0.3 * (self._x - x_pred)   # light velocity update
+        self._p = (1 - k) * p_pred
+        return self._x
+
+
+# ── Face centre detection at detection_fps ────────────────────────────────────
+
+def _face_centres_single(
+    video_path: str,
+    start: float,
+    end: float,
+    detection_fps: float = 5.0,
+) -> list[tuple[float, float]]:
+    """
+    Return (cx, cy) pixel coordinates of the *largest* face detected,
+    sampled at detection_fps, smoothed with Kalman, then interpolated
+    to every frame.
+
+    Returns a list of (cx, cy) with length == total_frames in [start, end].
+    """
+    cap      = cv2.VideoCapture(video_path)
+    src_fps  = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    src_w    = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h    = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+
+    total_frames = int((end - start) * src_fps)
+    step_frames  = max(1, int(src_fps / detection_fps))
+
+    # ── Pass 1: detect at detection_fps ──────────────────────────────────────
+    raw_cx: dict[int, float] = {}   # frame_idx → pixel cx
+    raw_cy: dict[int, float] = {}
+
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
+
+    with _mp_face.FaceDetection(min_detection_confidence=0.5) as detector:
+        for local_idx in range(total_frames):
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if local_idx % step_frames != 0:
+                continue
+
+            faces = _detect_faces(frame, detector)
+            if not faces:
+                continue
+
+            # Pick largest face (highest bounding-box area)
+            best = max(
+                faces,
+                key=lambda d: (
+                    d.location_data.relative_bounding_box.width
+                    * d.location_data.relative_bounding_box.height
+                ),
+            )
+            bb   = best.location_data.relative_bounding_box
+            raw_cx[local_idx] = (bb.xmin + bb.width  / 2) * src_w
+            raw_cy[local_idx] = (bb.ymin + bb.height / 2) * src_h
+
+    cap.release()
+
+    if not raw_cx:
+        # No face found at all — return frame centres
+        log.warning("_face_centres_single: no faces detected, using frame centre")
+        return [(src_w / 2, src_h / 2)] * total_frames
+
+    # ── Pass 2: fill gaps by propagating the last known detection ─────────────
+    filled_cx = {}
+    filled_cy = {}
+    last_x, last_y = src_w / 2, src_h / 2
+    for i in range(total_frames):
+        if i in raw_cx:
+            last_x, last_y = raw_cx[i], raw_cy[i]
+        filled_cx[i] = last_x
+        filled_cy[i] = last_y
+
+    # ── Pass 3: Kalman smooth the detection keyframes ─────────────────────────
+    kx, ky = _Kalman1D(), _Kalman1D()
+    smoothed: dict[int, tuple[float, float]] = {}
+    for i in sorted(filled_cx):
+        smoothed[i] = (kx.update(filled_cx[i]), ky.update(filled_cy[i]))
+
+    # ── Pass 4: linear interpolate to every frame ─────────────────────────────
+    keyframes = sorted(smoothed)
+    result    = []
+    for i in range(total_frames):
+        # find surrounding keyframes
+        lo = max((k for k in keyframes if k <= i), default=keyframes[0])
+        hi = min((k for k in keyframes if k >= i), default=keyframes[-1])
+        if lo == hi:
+            result.append(smoothed[lo])
+        else:
+            t = (i - lo) / (hi - lo)
+            cx = smoothed[lo][0] + t * (smoothed[hi][0] - smoothed[lo][0])
+            cy = smoothed[lo][1] + t * (smoothed[hi][1] - smoothed[lo][1])
+            result.append((cx, cy))
+
+    return result
+
+
+# ── Frame rendering helper ────────────────────────────────────────────────────
+
+def _crop_frame(
+    frame: np.ndarray,
+    cx: float,
+    cy: float,
+    crop_w: int,
+    crop_h: int,
+    out_w: int,
+    out_h: int,
+) -> np.ndarray:
+    """Crop a (crop_w × crop_h) window centred on (cx, cy), resize to (out_w × out_h)."""
+    src_h, src_w = frame.shape[:2]
+
+    x1 = int(cx - crop_w / 2)
+    y1 = int(cy - crop_h / 2)
+    # Clamp so the crop stays inside the frame
+    x1 = max(0, min(x1, src_w - crop_w))
+    y1 = max(0, min(y1, src_h - crop_h))
+
+    cropped = frame[y1 : y1 + crop_h, x1 : x1 + crop_w]
+    return cv2.resize(cropped, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+
+
+def _open_ffmpeg_pipe(output_path: str, out_w: int, out_h: int, fps: float) -> subprocess.Popen:
+    """Start an FFmpeg process that reads raw BGR frames from stdin and encodes to output_path."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo", "-vcodec", "rawvideo",
+        "-s", f"{out_w}x{out_h}",
+        "-pix_fmt", "bgr24",
+        "-r", str(fps),
+        "-i", "pipe:0",
+        "-vcodec", _ENCODER,
+    ]
+    if _ENCODER == "h264_nvenc":
+        cmd += ["-preset", "p4", "-rc", "vbr", "-cq", "26"]
+    else:
+        cmd += ["-preset", "fast", "-crf", "23"]
+    cmd += ["-pix_fmt", "yuv420p", output_path]
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+
+def _mux_audio(video_only: str, source_video: str, start: float, duration: float, final: str):
+    """Extract audio from source_video[start:start+duration] and mux into video_only → final."""
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-ss", str(start), "-t", str(duration), "-i", source_video,
+            "-i", video_only,
+            "-map", "1:v", "-map", "0:a",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+            "-shortest", final,
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _add_watermark(frame: np.ndarray) -> np.ndarray:
+    """Burn a subtle 'ViralClips' watermark into the bottom-centre of the frame."""
+    h, w = frame.shape[:2]
+    text  = "ViralClips"
+    font  = cv2.FONT_HERSHEY_SIMPLEX
+    scale = w / 800          # scale relative to frame width
+    thick = max(1, int(scale * 2))
+    (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
+    x = (w - tw) // 2
+    y = h - 28
+    # Dark shadow then white text
+    cv2.putText(frame, text, (x + 2, y + 2), font, scale, (0, 0, 0),     thick + 1, cv2.LINE_AA)
+    cv2.putText(frame, text, (x,     y    ), font, scale, (220, 220, 220), thick,     cv2.LINE_AA)
+    return frame
+
+
+# ── Single-face reframe ───────────────────────────────────────────────────────
+
+def reframe_single_face(
+    video_path: str,
+    start: float,
+    end: float,
+    output_path: str,
+    watermark: bool = False,
+) -> None:
+    """
+    Reframe clip [start, end] to 1080×1920 centred on the tracked face.
+    Writes the final muxed file to output_path.
+    """
+    OUT_W, OUT_H = 1080, 1920
+
+    cap     = cv2.VideoCapture(video_path)
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    src_h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    src_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    cap.release()
+
+    # 9:16 crop dimensions — use full source height, derive width
+    crop_h = src_h
+    crop_w = int(src_h * OUT_W / OUT_H)
+    if crop_w > src_w:          # source is already narrower than 9:16
+        crop_w = src_w
+        crop_h = int(src_w * OUT_H / OUT_W)
+
+    duration     = end - start
+    total_frames = int(duration * src_fps)
+
+    log.info("single_face reframe: %.1fs clip, crop=%dx%d, encoder=%s", duration, crop_w, crop_h, _ENCODER)
+
+    centres = _face_centres_single(video_path, start, end)
+
+    # Video-only temp file (audio added in mux step)
+    vid_tmp = str(WORK_DIR / f"{os.path.basename(output_path)}.vidonly.mp4")
+
+    proc = _open_ffmpeg_pipe(vid_tmp, OUT_W, OUT_H, src_fps)
+
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
+
+    for i in range(total_frames):
+        ok, frame = cap.read()
+        if not ok:
+            break
+        cx, cy = centres[i] if i < len(centres) else (src_w / 2, src_h / 2)
+        out    = _crop_frame(frame, cx, cy, crop_w, crop_h, OUT_W, OUT_H)
+        if watermark:
+            out = _add_watermark(out)
+        proc.stdin.write(out.tobytes())
+
+    proc.stdin.close()
+    proc.wait()
+    cap.release()
+
+    _mux_audio(vid_tmp, video_path, start, duration, output_path)
+    os.unlink(vid_tmp)
+    log.info("single_face done → %s", output_path)
