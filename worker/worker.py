@@ -540,3 +540,340 @@ def reframe_single_face(
     _mux_audio(vid_tmp, video_path, start, duration, output_path)
     os.unlink(vid_tmp)
     log.info("single_face done → %s", output_path)
+
+
+# ── Piece 4: Dual-Face (Podcast) Layout + Active Speaker Detection ────────────
+#
+# Goal: 9:16 output split into two stacked slots.
+#   Top    60%  (1080 × 1152) → active speaker, tracked crop
+#   Bottom 40%  (1080 ×  768) → listener,       tracked crop
+#
+# Pipeline:
+#   1. Detect up to 2 faces per sample frame at 5 FPS using MediaPipe Face Mesh
+#      (Face Mesh gives us 468 landmarks — we use lip aperture to gauge speech)
+#   2. Assign a stable identity to each face across frames (left / right by x-pos)
+#   3. Estimate active speaker per sample frame:
+#       a. Try Light-ASD (pip install light-asd) if available
+#       b. Fallback: measure lip aperture (landmark 13 / 14 distance) and pick
+#          the face whose mouth is more open — debounced over 30 frames (≈1 s)
+#   4. Smooth speaker assignments with a 30-frame debounce so the layout
+#      doesn't flicker every time one person nods
+#   5. Per output frame: crop each face slot, stack vertically, pipe to FFmpeg
+
+
+_mp_mesh = mp.solutions.face_mesh
+
+OUT_W        = 1080
+OUT_H        = 1920
+ACTIVE_H     = int(OUT_H * 0.60)   # 1152  — top slot
+PASSIVE_H    = OUT_H - ACTIVE_H    # 768   — bottom slot
+ACTIVE_AR    = OUT_W / ACTIVE_H    # ~0.938
+PASSIVE_AR   = OUT_W / PASSIVE_H   # ~1.406
+
+# MediaPipe Face Mesh lip aperture landmarks
+_UPPER_LIP = 13
+_LOWER_LIP = 14
+
+
+# ── 4a: Detect two faces + lip aperture across the clip ──────────────────────
+
+def _track_two_faces(
+    video_path: str,
+    start: float,
+    end: float,
+    detection_fps: float = 5.0,
+) -> list[dict]:
+    """
+    Sample frames at detection_fps.  For each sample return:
+        {
+          "t":          float,         # timestamp in seconds
+          "frame_idx":  int,           # local frame index from start
+          "faces": [                   # sorted left→right by cx
+              {"cx": float, "cy": float,   # normalised [0,1]
+               "w":  float, "h":  float,
+               "lip_gap": float},      # lip aperture in normalised units
+          ]
+        }
+    Frames with fewer than 2 detected faces are still included (1 or 0 faces).
+    """
+    cap     = cv2.VideoCapture(video_path)
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    cap.release()
+
+    total_frames = int((end - start) * src_fps)
+    step         = max(1, int(src_fps / detection_fps))
+
+    records = []
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
+
+    with _mp_mesh.FaceMesh(
+        max_num_faces=2,
+        refine_landmarks=False,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    ) as mesh:
+        for local_idx in range(total_frames):
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if local_idx % step != 0:
+                continue
+
+            rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            result = mesh.process(rgb)
+            faces  = []
+
+            if result.multi_face_landmarks:
+                for lms in result.multi_face_landmarks:
+                    ul  = lms.landmark[_UPPER_LIP]
+                    ll  = lms.landmark[_LOWER_LIP]
+                    gap = abs(ul.y - ll.y)
+
+                    # Bounding box from all 468 landmarks
+                    xs  = [lm.x for lm in lms.landmark]
+                    ys  = [lm.y for lm in lms.landmark]
+                    x0, x1_ = min(xs), max(xs)
+                    y0, y1_ = min(ys), max(ys)
+                    faces.append({
+                        "cx":      (x0 + x1_) / 2,
+                        "cy":      (y0 + y1_) / 2,
+                        "w":       x1_ - x0,
+                        "h":       y1_ - y0,
+                        "lip_gap": gap,
+                    })
+
+            # Stable ordering: left face first (lower cx)
+            faces.sort(key=lambda f: f["cx"])
+
+            records.append({
+                "t":         start + local_idx / src_fps,
+                "frame_idx": local_idx,
+                "faces":     faces,
+            })
+
+    cap.release()
+    return records
+
+
+# ── 4b: Active-speaker detection ─────────────────────────────────────────────
+
+def _active_speaker_light_asd(video_path: str, start: float, end: float, n_faces: int) -> list[int] | None:
+    """
+    Try Light-ASD.  Returns per-sample list of active face index (0 or 1),
+    or None if the package is unavailable / fails.
+    """
+    try:
+        # Light-ASD may be installed under either name
+        try:
+            from lightASD.light_asd import LightASD   # noqa: PLC0415
+        except ImportError:
+            from light_asd import LightASD             # noqa: PLC0415
+
+        model   = LightASD()
+        results = model.predict(video_path, start_time=start, end_time=end)
+        # results is a list of dicts with "speaker" key (0-indexed face)
+        return [int(r.get("speaker", 0)) for r in results]
+    except Exception as exc:
+        log.info("Light-ASD unavailable (%s), using lip-aperture fallback", exc)
+        return None
+
+
+def _active_speaker_lip_fallback(records: list[dict]) -> list[int]:
+    """
+    Fallback: pick the face with the larger lip aperture per sample.
+    If only one face is detected, that face is always active.
+    Apply a 30-sample debounce to prevent rapid flipping.
+    """
+    raw = []
+    for rec in records:
+        faces = rec["faces"]
+        if len(faces) == 0:
+            raw.append(0)
+        elif len(faces) == 1:
+            raw.append(0)
+        else:
+            raw.append(0 if faces[0]["lip_gap"] >= faces[1]["lip_gap"] else 1)
+
+    # Debounce: only switch after 30 consecutive samples on the other speaker
+    DEBOUNCE = 30
+    smoothed = list(raw)
+    current  = raw[0] if raw else 0
+    streak   = 0
+
+    for i, v in enumerate(raw):
+        if v == current:
+            streak = 0
+        else:
+            streak += 1
+            if streak >= DEBOUNCE:
+                current = v
+                streak  = 0
+        smoothed[i] = current
+
+    return smoothed
+
+
+def _get_active_per_sample(
+    video_path: str,
+    start: float,
+    end: float,
+    records: list[dict],
+) -> list[int]:
+    """
+    Return per-sample active speaker index (0 = left/first, 1 = right/second).
+    """
+    n_faces = max((len(r["faces"]) for r in records), default=1)
+
+    asd = _active_speaker_light_asd(video_path, start, end, n_faces)
+    if asd is not None and len(asd) == len(records):
+        log.info("Using Light-ASD for speaker detection")
+        return asd
+
+    log.info("Using lip-aperture fallback for speaker detection")
+    return _active_speaker_lip_fallback(records)
+
+
+# ── 4c: Per-slot crop helper ──────────────────────────────────────────────────
+
+def _slot_crop(
+    frame: np.ndarray,
+    face: dict | None,
+    slot_w: int,
+    slot_h: int,
+) -> np.ndarray:
+    """
+    Crop a slot_w × slot_h region around `face` from `frame` and resize.
+    If face is None (not detected this frame), return a centre crop.
+    """
+    src_h, src_w = frame.shape[:2]
+    aspect = slot_w / slot_h
+
+    if face is None:
+        # Centre crop with slot aspect ratio
+        crop_w = min(src_w, int(src_h * aspect))
+        crop_h = min(src_h, int(src_w / aspect))
+        x1 = (src_w - crop_w) // 2
+        y1 = (src_h - crop_h) // 2
+    else:
+        cx_px = face["cx"] * src_w
+        cy_px = face["cy"] * src_h
+        fh_px = face["h"]  * src_h
+
+        # Give generous headroom: crop height = 3× face height, min 30% of frame
+        crop_h = int(max(fh_px * 3.0, src_h * 0.30))
+        crop_w = int(crop_h * aspect)
+
+        # Clamp to frame
+        if crop_w > src_w:
+            crop_w = src_w
+            crop_h = int(crop_w / aspect)
+        if crop_h > src_h:
+            crop_h = src_h
+            crop_w = int(crop_h * aspect)
+
+        x1 = int(max(0, min(cx_px - crop_w / 2, src_w - crop_w)))
+        y1 = int(max(0, min(cy_px - crop_h / 2, src_h - crop_h)))
+
+    cropped = frame[y1 : y1 + crop_h, x1 : x1 + crop_w]
+    return cv2.resize(cropped, (slot_w, slot_h), interpolation=cv2.INTER_LINEAR)
+
+
+# ── 4d: Build per-frame lookup tables from sampled records ───────────────────
+
+def _build_frame_tables(
+    records: list[dict],
+    active_per_sample: list[int],
+    total_frames: int,
+    src_fps: float,
+    start: float,
+) -> tuple[list[dict | None], list[dict | None], list[int]]:
+    """
+    Expand sample-rate records to per-frame tables.
+    Returns (active_face_per_frame, passive_face_per_frame, active_idx_per_frame).
+    Missing frames are filled by nearest sample.
+    """
+    # Build a sorted list of (frame_idx, active_face, passive_face)
+    samples = []
+    for rec, act_idx in zip(records, active_per_sample):
+        fi     = rec["frame_idx"]
+        faces  = rec["faces"]
+        act_f  = faces[act_idx]           if len(faces) > act_idx  else None
+        pas_f  = faces[1 - act_idx]       if len(faces) == 2       else None
+        samples.append((fi, act_f, pas_f, act_idx))
+
+    if not samples:
+        return [None]*total_frames, [None]*total_frames, [0]*total_frames
+
+    active_faces  = []
+    passive_faces = []
+    active_idxs   = []
+
+    for i in range(total_frames):
+        # Find nearest sample
+        nearest = min(samples, key=lambda s: abs(s[0] - i))
+        active_faces.append(nearest[1])
+        passive_faces.append(nearest[2])
+        active_idxs.append(nearest[3])
+
+    return active_faces, passive_faces, active_idxs
+
+
+# ── 4e: Main dual-face reframe ────────────────────────────────────────────────
+
+def reframe_dual_face(
+    video_path: str,
+    start: float,
+    end: float,
+    output_path: str,
+    watermark: bool = False,
+) -> None:
+    """
+    Reframe a podcast/interview clip to 1080×1920.
+    Active speaker fills top 60%, listener fills bottom 40%.
+    Writes final muxed file to output_path.
+    """
+    cap     = cv2.VideoCapture(video_path)
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    cap.release()
+
+    duration     = end - start
+    total_frames = int(duration * src_fps)
+
+    log.info("dual_face reframe: %.1fs clip, encoder=%s", duration, _ENCODER)
+
+    # ── Detect + plan ─────────────────────────────────────────────────────────
+    records          = _track_two_faces(video_path, start, end)
+    active_per_samp  = _get_active_per_sample(video_path, start, end, records)
+    act_faces, pas_faces, _ = _build_frame_tables(
+        records, active_per_samp, total_frames, src_fps, start,
+    )
+
+    # ── Render ────────────────────────────────────────────────────────────────
+    vid_tmp = str(WORK_DIR / f"{os.path.basename(output_path)}.vidonly.mp4")
+    proc    = _open_ffmpeg_pipe(vid_tmp, OUT_W, OUT_H, src_fps)
+
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
+
+    for i in range(total_frames):
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        top    = _slot_crop(frame, act_faces[i],  OUT_W, ACTIVE_H)
+        bottom = _slot_crop(frame, pas_faces[i],  OUT_W, PASSIVE_H)
+        combined = np.vstack([top, bottom])   # 1080 × 1920
+
+        if watermark:
+            combined = _add_watermark(combined)
+
+        proc.stdin.write(combined.tobytes())
+
+    proc.stdin.close()
+    proc.wait()
+    cap.release()
+
+    _mux_audio(vid_tmp, video_path, start, duration, output_path)
+    os.unlink(vid_tmp)
+    log.info("dual_face done → %s", output_path)
