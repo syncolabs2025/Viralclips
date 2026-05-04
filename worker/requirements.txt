@@ -1,15 +1,54 @@
+# ── Core pipeline ─────────────────────────────────────────────────────────────
 openai==1.58.1
-opencv-python-headless==4.10.0.84
-mediapipe==0.10.18
-ffmpeg-python==0.2.0
-google-cloud-storage==2.19.0
 psycopg2-binary==2.9.10
 redis==5.2.1
 rq==2.1.0
+google-cloud-storage==2.19.0
 resend==2.4.0
+
+# ── CV / encoding ──────────────────────────────────────────────────────────────
+opencv-python-headless==4.10.0.84
+ffmpeg-python==0.2.0
 numpy==1.26.4
-# torch + torchvision — CPU wheels used here; swap for CUDA in prod (see Dockerfile)
-torch==2.5.1
-torchvision==0.20.1
-# Active speaker detection (optional — fallback to lip-aperture if absent)
-light-asd==1.0.3
+Pillow==10.4.0
+mediapipe==0.10.18          # Kalman-fallback face detection
+
+# ── PyTorch (L4 CUDA 12.x — swap wheels for CPU in local dev) ─────────────────
+torch==2.3.1
+torchvision==0.18.1
+torchaudio==2.3.1
+
+# ── Face detection + ArcFace ReID ─────────────────────────────────────────────
+insightface==0.7.3
+onnxruntime-gpu==1.18.1     # CPU fallback: onnxruntime==1.18.1
+
+# ── Transformer models (Qwen2-VL, pyannote) ───────────────────────────────────
+transformers==4.44.0
+accelerate==0.33.0
+bitsandbytes==0.43.3        # INT8 quantisation for Qwen2-VL
+
+# ── SAM-2 (install from source: pip install git+https://github.com/facebookresearch/sam2)
+# segment-anything-2
+
+# ── GroundingDINO (install from source: pip install groundingdino-py) ─────────
+# groundingdino-py
+
+# ── Speaker diarization ────────────────────────────────────────────────────────
+pyannote.audio==3.3.2
+
+# ── Beat detection ─────────────────────────────────────────────────────────────
+librosa==0.10.2
+soundfile==0.12.1
+
+# ── Shot detection ─────────────────────────────────────────────────────────────
+scenedetect[opencv]==0.6.4
+# transnetv2                # install from source: pip install git+https://github.com/soCzech/TransNetV2
+
+# ── Cross-shot identity clustering ────────────────────────────────────────────
+scikit-learn==1.5.1
+
+# ── Modal (deployment only — not needed inside the container itself) ───────────
+# modal==0.64.0
+
+# ── Hugging Face Hub (model downloads) ────────────────────────────────────────
+huggingface-hub==0.24.6
